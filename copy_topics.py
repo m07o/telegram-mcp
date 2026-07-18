@@ -68,9 +68,7 @@ def save_progress(progress: ProgressDict) -> None:
         json.dump(progress, f, ensure_ascii=False, indent=2)
 
 
-async def get_all_topics(
-    client: TelegramClient, entity: ChatLike
-) -> list[types.ForumTopic]:
+async def get_all_topics(client: TelegramClient, entity: ChatLike) -> list[types.ForumTopic]:
     """Materialize the full topic list (use only when iteration isn't enough)."""
     return await list_forum_topics(client, entity)
 
@@ -84,9 +82,7 @@ def get_topic_title(topic: types.ForumTopic) -> str:
     return title.strip()
 
 
-async def count_topic_messages(
-    client: TelegramClient, entity: ChatLike, topic_id: int
-) -> int:
+async def count_topic_messages(client: TelegramClient, entity: ChatLike, topic_id: int) -> int:
     """Count messages in a topic (cheap, server-side)."""
     count = 0
     async for _ in client.iter_messages(entity, reply_to=topic_id):
@@ -94,9 +90,7 @@ async def count_topic_messages(
     return count
 
 
-async def get_target_topics_map(
-    client: TelegramClient, entity: ChatLike
-) -> TopicsMap:
+async def get_target_topics_map(client: TelegramClient, entity: ChatLike) -> TopicsMap:
     """Build a ``title -> topic_id`` map for every topic in the target group."""
     topics_map: TopicsMap = {}
     async for t in iter_forum_topics(client, entity):
@@ -315,7 +309,9 @@ async def cmd_copy(args: argparse.Namespace) -> None:
             source_count = await count_topic_messages(client, from_entity, topic.id)
             target_count = await count_topic_messages(client, to_entity, target_map[title])
             if target_count >= source_count:
-                print(f"[{i}/{total}] SKIP (already complete): {title} ({target_count}/{source_count})")
+                print(
+                    f"[{i}/{total}] SKIP (already complete): {title} ({target_count}/{source_count})"
+                )
                 stats = progress["stats"]
                 stats["skipped"] = stats.get("skipped", 0) + 1
                 continue
@@ -393,12 +389,8 @@ def main() -> None:
         default=0.5,
         help="Delay between messages in seconds (default: 0.5)",
     )
-    parser.add_argument(
-        "--resume", action="store_true", help="Resume from last progress file"
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true", help="List topics without copying"
-    )
+    parser.add_argument("--resume", action="store_true", help="Resume from last progress file")
+    parser.add_argument("--dry-run", action="store_true", help="List topics without copying")
     parser.add_argument(
         "--check",
         action="store_true",

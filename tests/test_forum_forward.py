@@ -42,4 +42,7 @@ def test_forward_tool_summary_shape() -> None:
         "failed": 1,
     }
     assert "job_id" in summary
-    assert summary["copied"] + summary["partial"] + summary["skipped"] + summary["failed"] == summary["total"]
+    assert (
+        summary["copied"] + summary["partial"] + summary["skipped"] + summary["failed"]
+        == summary["total"]
+    )

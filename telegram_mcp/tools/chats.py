@@ -1156,8 +1156,7 @@ async def copy_topic(
         try:
             topics_res = await cl(
                 functions.messages.GetForumTopicsRequest(
-                    peer=to_entity, offset_date=0, offset_id=0,
-                    offset_topic=0, limit=100
+                    peer=to_entity, offset_date=0, offset_id=0, offset_topic=0, limit=100
                 )
             )
             for t in getattr(topics_res, "topics", []) or []:

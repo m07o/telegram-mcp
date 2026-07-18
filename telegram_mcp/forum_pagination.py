@@ -78,9 +78,15 @@ async def list_forum_topics(
     inter_page_delay: float = INTER_PAGE_DELAY,
 ) -> list[types.ForumTopic]:
     """Materialize the full list of forum topics (use only when iteration isn't enough)."""
-    return [t async for t in iter_forum_topics(
-        client, entity, page_size=page_size, inter_page_delay=inter_page_delay,
-    )]
+    return [
+        t
+        async for t in iter_forum_topics(
+            client,
+            entity,
+            page_size=page_size,
+            inter_page_delay=inter_page_delay,
+        )
+    ]
 
 
 async def get_topic_title(
@@ -95,15 +101,11 @@ async def get_topic_title(
     the topic cannot be found (e.g. General topic or deleted topic).
     """
     try:
-        result = await client(
-            GetForumTopicsByIDRequest(peer=chat_id, topics=[topic_id])
-        )
+        result = await client(GetForumTopicsByIDRequest(peer=chat_id, topics=[topic_id]))
         if result.messages:
             return result.messages[0].message or f"<topic {topic_id}>"
     except Exception as exc:
-        logging.getLogger(__name__).debug(
-            "get_topic_title failed for topic %s: %s", topic_id, exc
-        )
+        logging.getLogger(__name__).debug("get_topic_title failed for topic %s: %s", topic_id, exc)
     return f"<topic {topic_id}>"
 
 
