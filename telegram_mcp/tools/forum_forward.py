@@ -238,6 +238,7 @@ async def forward_topics_from_group(
 
                 store.save(progress)
             except Exception as e:
+                logger.warning("Failed to process topic %s: %s", topic.id, e)
                 failed += 1
                 store.mark_topic_failed(
                     progress, topic_id=topic.id, title=title, error=str(e)[:200]
