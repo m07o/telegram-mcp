@@ -9,11 +9,13 @@ implementation and the standalone ``copy_topics.py`` script.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from typing import Union
 
 from telethon import TelegramClient, functions
 from telethon.tl import types
+from telethon.tl.functions.messages import GetForumTopicsByIDRequest
 
 #: Topic page size requested per call; matches the Telegram API limit.
 PAGE_SIZE: int = 100
@@ -92,16 +94,16 @@ async def get_topic_title(
     without loading all messages.  Returns ``"<topic {topic_id}>"`` if
     the topic cannot be found (e.g. General topic or deleted topic).
     """
-    from telethon.tl.functions.messages import GetForumTopicsByIDRequest
-
     try:
         result = await client(
-            GetForumTopicsByIDRequest(channel=chat_id, topics=[topic_id])
+            GetForumTopicsByIDRequest(peer=chat_id, topics=[topic_id])
         )
         if result.messages:
             return result.messages[0].message or f"<topic {topic_id}>"
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger(__name__).debug(
+            "get_topic_title failed for topic %s: %s", topic_id, exc
+        )
     return f"<topic {topic_id}>"
 
 
