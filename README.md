@@ -524,16 +524,7 @@ Telegram messages, display names, chat titles, and button labels are untrusted c
 
 ## Contributing
 
-1. Fork and clone the repository.
-2. Install dependencies and git hooks:
-   - `uv sync`
-   - `uv run pre-commit install --hook-type pre-commit --hook-type pre-push`
-3. Create a focused branch.
-4. Add or update tests when behavior changes.
-5. Run checks locally:
-   - `uv run pre-commit run --all-files`
-   - `uv run pre-commit run --hook-stage pre-push --all-files`
-6. Open a pull request with a concise description.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, workflow, and code style guidelines.
 
 ## License
 
