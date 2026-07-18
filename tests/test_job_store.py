@@ -25,7 +25,12 @@ def test_job_store_creates_file(tmp_store: JobStore) -> None:
 
 def test_job_store_roundtrip(tmp_store: JobStore) -> None:
     p1 = tmp_store.load_or_create("fwd_abc123")
-    p1.copied_topics["42"] = {"title": "Test Topic", "source_count": 10, "copied_count": 10, "status": "complete"}
+    p1.copied_topics["42"] = {
+        "title": "Test Topic",
+        "source_count": 10,
+        "copied_count": 10,
+        "status": "complete",
+    }
     p1.failed_topics.append({"id": 99, "title": "Bad", "error": "timeout"})
     tmp_store.save(p1)
     p2 = tmp_store.load_or_create("fwd_abc123")
@@ -47,7 +52,9 @@ def test_job_store_mark_topic_complete(tmp_store: JobStore) -> None:
 
 def test_job_store_mark_topic_partial(tmp_store: JobStore) -> None:
     p = tmp_store.load_or_create("fwd_xyz")
-    tmp_store.mark_topic_complete(p, topic_id="101", title="Partial", source_count=10, copied_count=7)
+    tmp_store.mark_topic_complete(
+        p, topic_id="101", title="Partial", source_count=10, copied_count=7
+    )
     assert p.copied_topics["101"]["status"] == "partial"
 
 
