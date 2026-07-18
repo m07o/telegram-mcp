@@ -66,3 +66,37 @@ def test_job_store_list_jobs(tmp_store: JobStore) -> None:
     jobs = tmp_store.list_jobs()
     assert "fwd_a.json" in jobs
     assert "fwd_b.json" in jobs
+
+
+def test_generate_job_id_format() -> None:
+    from telegram_mcp.job_store import generate_job_id
+
+    jid = generate_job_id()
+    assert jid.startswith("fwd_")
+    assert len(jid) == 20
+
+
+def test_job_store_path_sanitization(tmp_store: JobStore) -> None:
+    p = tmp_store.load_or_create("fwd/../../etc/passwd")
+    tmp_store.save(p)
+    # Should not create files outside base_dir
+    assert not (tmp_store.base_dir / ".." / "etc").exists()
+
+
+def test_job_store_load_or_create_corrupted_json(tmp_store: JobStore) -> None:
+    path = tmp_store.base_dir / "fwd_corrupt.json"
+    path.write_text("not valid json {{{", encoding="utf-8")
+    progress = tmp_store.load_or_create("fwd_corrupt")
+    assert progress.copied_topics == {}
+
+
+def test_job_progress_started_at_auto_populated() -> None:
+    p = JobProgress(job_id="test", from_chat_id="", to_chat_id="")
+    assert p.started_at != ""
+
+
+def test_job_store_list_jobs_excludes_non_json(tmp_store: JobStore) -> None:
+    (tmp_store.base_dir / "notes.txt").write_text("hello")
+    tmp_store.load_or_create("fwd_x")
+    jobs = tmp_store.list_jobs()
+    assert "notes.txt" not in jobs

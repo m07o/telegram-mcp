@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import secrets
@@ -12,12 +13,19 @@ from typing import Any
 
 
 def _default_base_dir() -> Path:
+    """Return the default cache directory for job state files."""
     cache_home = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
     return Path(cache_home) / "telegram-mcp" / "jobs"
 
 
 @dataclass
 class JobProgress:
+    """Tracks progress for a single topic-forward job.
+
+    Fields are persisted to a JSON file after each save so that work
+    can be resumed if the process is interrupted.
+    """
+
     job_id: str
     from_chat_id: str
     to_chat_id: str
@@ -32,11 +40,19 @@ class JobProgress:
 
 
 class JobStore:
+    """File-backed store that persists one JSON file per job.
+
+    Each file lives under *base_dir* and is named ``<job_id>.json``.
+    Path separators in *job_id* are replaced with underscores to
+    prevent directory traversal.
+    """
+
     def __init__(self, base_dir: Path | None = None) -> None:
         self.base_dir = base_dir or _default_base_dir()
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
     def _path(self, job_id: str) -> Path:
+        """Return the on-disk path for *job_id*, sanitised to prevent traversal."""
         safe = job_id.replace("/", "_").replace("\\", "_")
         return self.base_dir / f"{safe}.json"
 
@@ -46,27 +62,25 @@ class JobStore:
         from_chat_id: str = "",
         to_chat_id: str = "",
     ) -> JobProgress:
+        """Load existing progress or create a fresh record."""
         path = self._path(job_id)
         if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                data: dict[str, Any] = json.load(f)
-            return JobProgress(**{k: v for k, v in data.items() if k in JobProgress.__dataclass_fields__})
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data: dict[str, Any] = json.load(f)
+                fields = {f.name for f in dataclasses.fields(JobProgress)}
+                return JobProgress(**{k: v for k, v in data.items() if k in fields})
+            except (json.JSONDecodeError, TypeError, KeyError):
+                pass  # Corrupted file — return fresh progress
         return JobProgress(job_id=job_id, from_chat_id=from_chat_id, to_chat_id=to_chat_id)
 
     def save(self, progress: JobProgress) -> None:
+        """Persist progress to disk."""
         progress.last_updated_at = datetime.now(timezone.utc).isoformat()
         path = self._path(progress.job_id)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(
-                {
-                    "job_id": progress.job_id,
-                    "from_chat_id": progress.from_chat_id,
-                    "to_chat_id": progress.to_chat_id,
-                    "started_at": progress.started_at,
-                    "last_updated_at": progress.last_updated_at,
-                    "copied_topics": progress.copied_topics,
-                    "failed_topics": progress.failed_topics,
-                },
+                dataclasses.asdict(progress),
                 f,
                 ensure_ascii=False,
                 indent=2,
@@ -81,6 +95,7 @@ class JobStore:
         source_count: int,
         copied_count: int,
     ) -> None:
+        """Record a topic as fully or partially copied."""
         status = "complete" if copied_count >= source_count else "partial"
         progress.copied_topics[str(topic_id)] = {
             "title": title,
@@ -97,11 +112,14 @@ class JobStore:
         title: str,
         error: str,
     ) -> None:
+        """Append a failed topic entry with its error message."""
         progress.failed_topics.append({"id": topic_id, "title": title, "error": error})
 
     def list_jobs(self) -> list[str]:
+        """Return filenames of all persisted job files."""
         return [p.name for p in self.base_dir.iterdir() if p.suffix == ".json"]
 
 
 def generate_job_id() -> str:
+    """Generate a unique job identifier with the ``fwd_`` prefix."""
     return f"fwd_{secrets.token_hex(8)}"
