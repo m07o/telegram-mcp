@@ -81,10 +81,47 @@ async def list_forum_topics(
     )]
 
 
+async def get_topic_title(
+    client: TelegramClient,
+    chat_id: int | str,
+    topic_id: int,
+) -> str:
+    """Fetch the title of a single forum topic by ID.
+
+    Uses the ``GetForumTopicsByIDRequest`` RPC to retrieve the topic title
+    without loading all messages.  Returns ``"<topic {topic_id}>"`` if
+    the topic cannot be found (e.g. General topic or deleted topic).
+    """
+    from telethon.tl.functions.messages import GetForumTopicsByIDRequest
+
+    try:
+        result = await client(
+            GetForumTopicsByIDRequest(channel=chat_id, topics=[topic_id])
+        )
+        if result.messages:
+            return result.messages[0].message or f"<topic {topic_id}>"
+    except Exception:
+        pass
+    return f"<topic {topic_id}>"
+
+
+def build_topic_index(
+    topics: list[types.ForumTopic],
+) -> dict[int, str]:
+    """Build a lookup dict mapping topic_id -> topic title.
+
+    Useful for resolving topic IDs to human-readable names
+    in progress reports and dry-run output.
+    """
+    return {t.id: t.title for t in topics}
+
+
 __all__ = [
     "PAGE_SIZE",
     "INTER_PAGE_DELAY",
     "ChatLike",
     "iter_forum_topics",
     "list_forum_topics",
+    "get_topic_title",
+    "build_topic_index",
 ]
