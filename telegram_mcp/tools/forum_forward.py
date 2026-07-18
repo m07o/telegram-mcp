@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import secrets
 import time
 from typing import Any, Optional, Union
+
+logger = logging.getLogger(__name__)
 
 from telethon import TelegramClient, functions
 from telethon.tl import types
@@ -26,7 +29,7 @@ from telegram_mcp.runtime import (
     with_account,
 )
 
-SKIP_PATTERNS: set[str] = {".", "===", "/", "@"}
+SKIP_PATTERNS: set[str] = {".", "===", "@"}
 
 
 async def _build_title_to_id_map(
@@ -115,7 +118,8 @@ async def _copy_single_topic(
 
             copied += 1
             await asyncio.sleep(delay)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to copy message in topic %s: %s", topic_id, exc)
             failed += 1
             await asyncio.sleep(1)
 
@@ -139,7 +143,7 @@ async def forward_topics_from_group(
     delay: float = 0.5,
     job_id: Optional[str] = None,
     force: bool = False,
-    account: str = None,
+    account: Optional[str] = None,
 ) -> str:
     """
     Copy all forum topics from one supergroup to another WITHOUT 'Forwarded from' tag.
@@ -199,25 +203,36 @@ async def forward_topics_from_group(
                 if status == "exists":
                     skipped += 1
                     store.mark_topic_complete(
-                        progress, topic_id=topic.id, title=title,
-                        source_count=source_count, copied_count=0,
+                        progress,
+                        topic_id=topic.id,
+                        title=title,
+                        source_count=source_count,
+                        copied_count=0,
                     )
                 elif status == "complete":
                     copied += 1
                     store.mark_topic_complete(
-                        progress, topic_id=topic.id, title=title,
-                        source_count=source_count, copied_count=copied_count,
+                        progress,
+                        topic_id=topic.id,
+                        title=title,
+                        source_count=source_count,
+                        copied_count=copied_count,
                     )
                 elif status == "partial":
                     partial += 1
                     store.mark_topic_complete(
-                        progress, topic_id=topic.id, title=title,
-                        source_count=source_count, copied_count=copied_count,
+                        progress,
+                        topic_id=topic.id,
+                        title=title,
+                        source_count=source_count,
+                        copied_count=copied_count,
                     )
                 else:
                     failed += 1
                     store.mark_topic_failed(
-                        progress, topic_id=topic.id, title=title,
+                        progress,
+                        topic_id=topic.id,
+                        title=title,
                         error="could not create target topic",
                     )
 
@@ -244,6 +259,7 @@ async def forward_topics_from_group(
         return json.dumps(summary, ensure_ascii=False)
 
     except Exception as e:
+        logger.error("forward_topics_from_group failed: %s", e)
         return log_and_format_error(
             "forward_topics_from_group",
             e,
