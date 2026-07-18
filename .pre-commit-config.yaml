@@ -38,6 +38,13 @@ repos:
         language: system
         pass_filenames: false
         stages: [pre-push]
+      - id: mypy-advisory
+        name: mypy (advisory)
+        entry: uv run mypy --explicit-package-bases
+        language: system
+        pass_filenames: true
+        stages: [pre-commit]
+        always_run: false
       - id: pytest-coverage-ci
         name: pytest with coverage (ci parity)
         entry: uv run --env-file .env.example pytest --cov --cov-report=term-missing --cov-report=xml

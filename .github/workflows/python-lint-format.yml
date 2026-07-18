@@ -35,3 +35,8 @@ jobs:
       - name: Check formatting with Black
         run: |
           black --check .
+
+      - name: Type check with mypy (advisory)
+        run: |
+          pip install mypy
+          mypy --explicit-package-bases copy_topics.py session_string_generator.py telegram_mcp/forum_pagination.py telegram_mcp/job_store.py || true
