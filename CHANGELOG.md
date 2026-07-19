@@ -9,17 +9,28 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/).
 ### Added
 - `forward_topics_from_group` MCP tool — copy all forum topics between supergroups with resume support.
 - `job_store.py` — per-job JSON progress persistence for long-running operations.
-- `forum_pagination.py` — shared forum-topic pagination helper (`iter_forum_topics`, `build_topic_index`, `get_topic_title`).
+- `forum_pagination.py` — shared forum-topic pagination helper (`iter_forum_topics`, `build_topic_index`, `get_topic_title`, `extract_created_topic_id`).
+- `count_topics` MCP tool — returns the TRUE total topic count (paginating past 100-per-request limit), so AI agents don't truncate at the page boundary.
 - `copy_topics.py` — standalone CLI for topic copying with `--check`, `--resume`, `--fix-incomplete` modes.
 - mypy configuration (advisory mode) in `pyproject.toml`.
 - Type hints for `copy_topics.py` and `session_string_generator.py`.
+- `tests/fakes/telethon_client.py` — fake Telethon client with scripted responses for integration tests.
+- Tests for `extract_created_topic_id`, `count_topics`, `_validate_forum_entities`, `_copy_single_topic` (id extraction, message order, skip patterns, service messages, prompt-injection safety, `force=True` semantics).
 
 ### Changed
 - `list_topics` tool: added `fetch_all` parameter to paginate past the 100-topic Telegram limit.
 - `list_topics` default limit reduced from 200 to 100 (matching Telegram's API maximum).
+- `forward_topics_from_group`: `force=True` now creates a fresh target topic (with same title) instead of append-merging into the existing one. Safer for re-runs.
+- `list_topics` docstring now explicitly warns about the 100-topic pagination limit and points to `count_topics` for fast totals.
 
 ### Fixed
-- Topic count undercounting when source group has >100 topics (was silently truncating).
+- **Critical:** `forward_topics_from_group`: every new topic creation was marked "failed" because the CreateForumTopic response was parsed for `result.messages` (empty) instead of `result.updates[].message.id`. Now uses shared `extract_created_topic_id` helper.
+- **Critical:** `forward_topics_from_group`: messages were copied in newest-first order (Telethon default), garbling conversation flow. Now collects and reverses to send oldest-first.
+- **Critical:** `forward_topics_from_group`: bare `"/"` message was being copied and could trigger bot commands on the destination group — now skipped like `.`/`===`/`@` patterns.
+- **Critical:** `copy_topics.py`: same topic-creation parsing bug as above — now uses the shared helper.
+- `forward_topics_from_group`: `source_count` included service/action messages but the copy loop skipped them, causing every topic with any service message to be wrongly marked `"partial"` even when fully copied. Now excludes actions from the count.
+- `forward_topics_from_group`: now validates both `from_chat_id` and `to_chat_id` are forum-enabled supergroups before processing (previously produced dozens of cryptic "failed" entries when a non-forum group was passed).
+- `forward_topics_from_group`: docstring now carries the standard untrusted-content prompt-injection warning used on every other user-content-returning tool.
 
 ## [2.0.1] - 2025-05-01
 
