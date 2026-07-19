@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator
-from typing import Union
+from typing import Any, Union
 
 from telethon import TelegramClient, functions
 from telethon.tl import types
