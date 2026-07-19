@@ -89,3 +89,25 @@ def test_get_topic_title_returns_fallback_on_empty_message_text() -> None:
     client = FakeClient(FakeResult([FakeMessage("")]))
     title = _run(get_topic_title(client, "testchat", 100))  # type: ignore[arg-type]
     assert title == "<topic 100>"
+
+
+def test_extract_created_topic_id_from_updates() -> None:
+    from telegram_mcp.forum_pagination import extract_created_topic_id
+
+    update = type("U", (), {"message": type("M", (), {"id": 555}), "id": None})()
+    result = type("R", (), {"updates": [update], "message": None})()
+    assert extract_created_topic_id(result) == 555
+
+
+def test_extract_created_topic_id_returns_none_when_no_updates() -> None:
+    from telegram_mcp.forum_pagination import extract_created_topic_id
+
+    result = type("R", (), {"updates": [], "message": None})()
+    assert extract_created_topic_id(result) is None
+
+
+def test_extract_created_topic_id_falls_back_to_message() -> None:
+    from telegram_mcp.forum_pagination import extract_created_topic_id
+
+    result = type("R", (), {"updates": [], "message": type("M", (), {"id": 99})})()
+    assert extract_created_topic_id(result) == 99

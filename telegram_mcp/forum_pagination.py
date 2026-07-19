@@ -120,6 +120,37 @@ def build_topic_index(
     return {t.id: t.title for t in topics}
 
 
+def extract_created_topic_id(result: Any) -> int | None:
+    """Best-effort extraction of the new topic's message id from a
+    CreateForumTopicRequest response.
+
+    Telethon returns ``Updates`` where the id lives inside
+    ``updates[].message.id`` (an ``UpdateNewMessage``). Falls back to
+    ``result.message.id`` for older variants. Returns None when no id
+    could be extracted.
+
+    This is the same logic as ``telegram_mcp.tools.chats._extract_created_topic_id``
+    but exposed here so both the MCP tool and the standalone CLI share it.
+    """
+    updates = getattr(result, "updates", None) or []
+    for update in updates:
+        message = getattr(update, "message", None)
+        message_id = getattr(message, "id", None)
+        if isinstance(message_id, int):
+            return message_id
+
+        update_id = getattr(update, "id", None)
+        if isinstance(update_id, int):
+            return update_id
+
+    message = getattr(result, "message", None)
+    message_id = getattr(message, "id", None)
+    if isinstance(message_id, int):
+        return message_id
+
+    return None
+
+
 __all__ = [
     "PAGE_SIZE",
     "INTER_PAGE_DELAY",
@@ -128,4 +159,5 @@ __all__ = [
     "list_forum_topics",
     "get_topic_title",
     "build_topic_index",
+    "extract_created_topic_id",
 ]

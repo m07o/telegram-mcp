@@ -17,6 +17,7 @@ from telethon.tl import types
 
 from telegram_mcp.forum_pagination import (
     ChatLike,
+    extract_created_topic_id,
     iter_forum_topics,
 )
 from telegram_mcp.job_store import JobProgress, JobStore, generate_job_id
@@ -73,15 +74,10 @@ async def _copy_single_topic(
                 random_id=secrets.randbits(63),
             )
         )
-        messages_attr = getattr(create_result, "messages", None)
-        target_topic_id = -1
-        if messages_attr:
-            for msg in messages_attr:
-                if hasattr(msg, "id"):
-                    target_topic_id = int(msg.id)
-                    break
-        if target_topic_id == -1:
+        extracted = extract_created_topic_id(create_result)
+        if extracted is None or extracted < 1:
             return (topic_id, title, "failed", source_count, 0)
+        target_topic_id = extracted
 
     copied = 0
     failed = 0

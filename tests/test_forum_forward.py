@@ -96,3 +96,37 @@ def test_forward_tool_resume_skips(tmp_path: Path) -> None:
     copied = {int(k) for k in p2.copied_topics.keys()}
     assert 10 in copied
     assert 11 in copied  # partial also counted as "handled"
+
+
+def test_copy_single_topic_extracts_id_from_updates() -> None:
+    """RED: bug #1 — CreateForumTopicRequest returns Updates, not .messages.
+
+    The new topic's id lives inside updates[].message.id, not result.messages.
+    Without proper extraction, the tool marks every new topic as 'failed'.
+    """
+    from telegram_mcp.tools.forum_forward import _copy_single_topic
+    from tests.fakes.telethon_client import FakeClient, FakeMessage, FakeUpdates
+
+    updates = FakeUpdates(updates=[_make_fake_update(555)])
+    client = FakeClient(
+        create_topic_result=updates,
+        topic_messages={1: [FakeMessage(id=10, message="hello")]},
+    )
+
+    async def _run() -> tuple[int, str, str, int, int]:
+        from types import SimpleNamespace
+
+        src_topic = SimpleNamespace(id=1, title="My Topic")
+        return await _copy_single_topic(
+            client,
+            from_entity="from",
+            to_entity="to",
+            source_topic=src_topic,
+            target_topics_map={},
+            delay=0.0,
+            force=False,
+        )
+
+    topic_id, title, status, source_count, copied_count = asyncio.run(_run())
+    assert status == "complete", f"expected complete, got {status}"
+    assert copied_count == 1
