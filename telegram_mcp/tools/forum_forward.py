@@ -58,7 +58,9 @@ async def _copy_single_topic(
     title: str = source_topic.title
 
     source_count = 0
-    async for _ in client.iter_messages(from_entity, reply_to=topic_id):
+    async for _msg in client.iter_messages(from_entity, reply_to=topic_id):
+        if getattr(_msg, "action", None):
+            continue
         source_count += 1
 
     if title in target_topics_map and not force:

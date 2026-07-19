@@ -210,3 +210,47 @@ def test_copy_single_topic_skips_bare_slash_message() -> None:
     sent_texts = [m["text"] for m in client.sent_messages]
     assert "/" not in sent_texts, f"bare slash should be skipped, got {sent_texts}"
     assert sent_texts == ["real content"]
+
+
+def test_copy_single_topic_status_complete_when_service_messages_skipped() -> None:
+    """RED: bug — source_count includes service messages but copy skips them.
+
+    A topic with 3 real messages + 1 service message should:
+      - source_count = 3 (excluding service)
+      - copied_count = 3
+      - status = "complete"
+    Current code counts all 4 and reports "partial".
+    """
+    from telegram_mcp.tools.forum_forward import _copy_single_topic
+    from tests.fakes.telethon_client import FakeClient, FakeMessage, FakeUpdates
+
+    updates = FakeUpdates(updates=[_make_fake_update(42)])
+    client = FakeClient(
+        create_topic_result=updates,
+        topic_messages={
+            1: [
+                FakeMessage(id=1, message="msg1"),
+                FakeMessage(id=2, message="", action="pin_added"),  # service
+                FakeMessage(id=3, message="msg2"),
+                FakeMessage(id=4, message="msg3"),
+            ]
+        },
+    )
+
+    async def _run() -> tuple[int, str, str, int, int]:
+        from types import SimpleNamespace
+        src_topic = SimpleNamespace(id=1, title="T")
+        return await _copy_single_topic(
+            client,
+            from_entity="from",
+            to_entity="to",
+            source_topic=src_topic,
+            target_topics_map={},
+            delay=0.0,
+            force=False,
+        )
+
+    _, _, status, source_count, copied_count = asyncio.run(_run())
+    assert source_count == 3, f"expected 3 (excluding service), got {source_count}"
+    assert copied_count == 3
+    assert status == "complete", f"expected complete, got {status}"
