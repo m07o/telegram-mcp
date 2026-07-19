@@ -239,6 +239,11 @@ async def list_topics(
     Note for LLM: You can send a message to a selected topic via reply_to_message tool
     by using Topic ID as the message_id parameter.
 
+    IMPORTANT: Telegram returns topics in pages of max 100. To get ALL topics,
+    you MUST pass fetch_all=True (do not assume limit=100 returns everything).
+    To get just the count, use count_topics instead — it's faster.
+    For manual pagination: pass offset_topic = the last topic ID from the previous batch.
+
     Args:
         chat_id: The ID of the forum-enabled chat (supergroup).
         limit: Maximum number of topics to retrieve per request (max 100, Telegram limit).
@@ -330,6 +335,65 @@ async def list_topics(
             fetch_all=fetch_all,
             search_query=search_query,
         )
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Count Topics", openWorldHint=True, readOnlyHint=True))
+@with_account(readonly=True)
+@validate_id("chat_id")
+async def count_topics(
+    chat_id: int,
+    account: str = None,
+) -> str:
+    """
+    Count the TRUE total number of forum topics in a supergroup, paginating
+    past Telegram's 100-per-request limit. Use this when you need an exact
+    count — do NOT use list_topics with a low limit and assume it's the total.
+
+    Args:
+        chat_id: The chat ID of the forum-enabled supergroup.
+
+    Returns:
+        JSON string with "count" (the true total) and "chat_id".
+
+    The chat must be a forum-enabled supergroup. Use enable_forum_topics first if not.
+    """
+    try:
+        cl = get_client(account)
+        entity = await resolve_entity(chat_id, cl)
+
+        if getattr(entity, "megagroup", False) is not True:
+            return "The specified chat is not a supergroup."
+
+        if getattr(entity, "forum", False) is not True:
+            return (
+                "The specified supergroup does not have forum topics enabled. "
+                "Use enable_forum_topics first."
+            )
+
+        total = 0
+        current_offset = 0
+        while True:
+            result = await cl(
+                GetForumTopicsRequest(
+                    channel=entity,
+                    offset_date=0,
+                    offset_id=0,
+                    offset_topic=current_offset,
+                    limit=100,
+                    q=None,
+                )
+            )
+            topics = getattr(result, "topics", None) or []
+            if not topics:
+                break
+            total += len(topics)
+            if len(topics) < 100:
+                break
+            current_offset = topics[-1].id
+
+        return format_tool_result([{"chat_id": chat_id, "count": total}])
+    except Exception as e:
+        return log_and_format_error("count_topics", e, chat_id=chat_id)
 
 
 @mcp.tool(
