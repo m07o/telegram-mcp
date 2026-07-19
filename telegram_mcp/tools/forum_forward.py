@@ -33,6 +33,27 @@ from telegram_mcp.runtime import (
 SKIP_PATTERNS: set[str] = {".", "===", "/", "@"}
 
 
+def _validate_forum_entities(
+    from_entity: Any,
+    to_entity: Any,
+) -> str | None:
+    """Return an error message if either entity is not a forum-enabled supergroup.
+
+    Returns None when both entities look like valid forum-enabled megagroups.
+    Uses duck-typing on the ``megagroup`` and ``forum`` flags so it works
+    against both real Telethon entities and test fakes (SimpleNamespace).
+    """
+    for label, entity in (("source", from_entity), ("destination", to_entity)):
+        if getattr(entity, "megagroup", False) is not True:
+            return f"The {label} chat is not a supergroup."
+        if getattr(entity, "forum", False) is not True:
+            return (
+                f"The {label} supergroup does not have forum topics enabled. "
+                f"Use enable_forum_topics first."
+            )
+    return None
+
+
 async def _build_title_to_id_map(
     client: TelegramClient,
     entity: ChatLike,
@@ -170,6 +191,10 @@ async def forward_topics_from_group(
         cl = get_client(account)
         from_entity = await resolve_entity(from_chat_id, cl)
         to_entity = await resolve_entity(to_chat_id, cl)
+
+        err = _validate_forum_entities(from_entity, to_entity)
+        if err:
+            return err
 
         if not job_id:
             job_id = generate_job_id()

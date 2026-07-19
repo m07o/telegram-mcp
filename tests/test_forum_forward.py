@@ -239,6 +239,7 @@ def test_copy_single_topic_status_complete_when_service_messages_skipped() -> No
 
     async def _run() -> tuple[int, str, str, int, int]:
         from types import SimpleNamespace
+
         src_topic = SimpleNamespace(id=1, title="T")
         return await _copy_single_topic(
             client,
@@ -254,3 +255,70 @@ def test_copy_single_topic_status_complete_when_service_messages_skipped() -> No
     assert source_count == 3, f"expected 3 (excluding service), got {source_count}"
     assert copied_count == 3
     assert status == "complete", f"expected complete, got {status}"
+
+
+def test_validate_forum_entities_rejects_non_supergroup() -> None:
+    """RED: non-supergroup rejected with clear message."""
+    from telegram_mcp.tools.forum_forward import _validate_forum_entities
+    from types import SimpleNamespace
+
+    # Fake "Chat" — not a Channel instance
+    chat_like = SimpleNamespace(id=100, title="Small")
+    valid = SimpleNamespace(id=200, title="Valid", megagroup=True, forum=True)
+    err = _validate_forum_entities(chat_like, valid)
+    assert err is not None
+    assert "supergroup" in err.lower()
+
+
+def test_validate_forum_entities_rejects_non_forum_channel() -> None:
+    """Forum-enabled flag must be set on the channel."""
+    from telegram_mcp.tools.forum_forward import _validate_forum_entities
+    from types import SimpleNamespace
+
+    valid = SimpleNamespace(id=1, title="A", megagroup=True, forum=True)
+    non_forum = SimpleNamespace(id=2, title="B", megagroup=True, forum=False)
+    err = _validate_forum_entities(valid, non_forum)
+    assert err is not None
+    assert "forum" in err.lower()
+
+
+def test_validate_forum_entities_accepts_valid_pair() -> None:
+    """Two valid forum-enabled megagroups return None."""
+    from telegram_mcp.tools.forum_forward import _validate_forum_entities
+    from types import SimpleNamespace
+
+    a = SimpleNamespace(id=1, title="A", megagroup=True, forum=True)
+    b = SimpleNamespace(id=2, title="B", megagroup=True, forum=True)
+    assert _validate_forum_entities(a, b) is None
+
+
+def test_forward_topics_rejects_non_forum_chat(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """RED: forwarding into a non-forum chat must return a clear error,
+    not produce dozens of cryptic 'failed' topic entries."""
+    from telegram_mcp.tools.forum_forward import forward_topics_from_group
+    from telegram_mcp.job_store import JobStore
+    from tests.fakes.telethon_client import FakeClient
+    from types import SimpleNamespace
+
+    valid = SimpleNamespace(id=1, title="A", megagroup=True, forum=True)
+    non_forum = SimpleNamespace(id=2, title="B", megagroup=True, forum=False)
+
+    async def fake_resolve(_chat_id: object, _client: object) -> object:
+        return non_forum
+
+    def fake_get_client(_account: object) -> FakeClient:
+        return FakeClient()
+
+    # Use a tmp_path JobStore so we don't pollute ~/.cache
+    def fake_JobStore(*args, **kwargs) -> JobStore:  # type: ignore[no-untyped-def]
+        return JobStore(base_dir=tmp_path / "jobs")
+
+    monkeypatch.setattr("telegram_mcp.tools.forum_forward.resolve_entity", fake_resolve)
+    monkeypatch.setattr("telegram_mcp.tools.forum_forward.get_client", fake_get_client)
+    monkeypatch.setattr("telegram_mcp.tools.forum_forward.JobStore", fake_JobStore)
+
+    result = asyncio.run(forward_topics_from_group(100, 200))
+    assert "forum" in result.lower(), f"expected 'forum' in error, got: {result}"
