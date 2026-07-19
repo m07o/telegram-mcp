@@ -322,3 +322,44 @@ def test_forward_topics_rejects_non_forum_chat(
 
     result = asyncio.run(forward_topics_from_group(100, 200))
     assert "forum" in result.lower(), f"expected 'forum' in error, got: {result}"
+
+
+def test_copy_single_topic_force_creates_fresh_topic_not_appends() -> None:
+    """RED: bug — force=True currently uses the existing target topic_id.
+
+    Per design, force=True should create a NEW topic with the same title
+    so re-runs don't append into the existing target topic.
+    """
+    from telegram_mcp.tools.forum_forward import _copy_single_topic
+    from tests.fakes.telethon_client import FakeClient, FakeMessage, FakeUpdates
+
+    updates = FakeUpdates(updates=[_make_fake_update(888)])
+    client = FakeClient(
+        create_topic_result=updates,
+        topic_messages={1: [FakeMessage(id=10, message="msg")]},
+    )
+
+    async def _run() -> None:
+        from types import SimpleNamespace
+
+        src_topic = SimpleNamespace(id=1, title="Existing")
+        target_map = {"Existing": 50}  # already exists in target with id 50
+        await _copy_single_topic(
+            client,
+            from_entity="from",
+            to_entity="to",
+            source_topic=src_topic,
+            target_topics_map=target_map,
+            delay=0.0,
+            force=True,  # should create a NEW topic
+        )
+
+    asyncio.run(_run())
+    assert (
+        len(client.created_topics) == 1
+    ), f"force=True should create a fresh topic, got {len(client.created_topics)} creates"
+    assert client.created_topics[0]["title"] == "Existing"
+    sent = client.sent_messages + client.sent_files
+    assert all(
+        s.get("reply_to") == 888 for s in sent
+    ), f"messages should go to new topic 888, got {sent}"
