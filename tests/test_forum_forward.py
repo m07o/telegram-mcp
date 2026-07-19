@@ -130,3 +130,43 @@ def test_copy_single_topic_extracts_id_from_updates() -> None:
     topic_id, title, status, source_count, copied_count = asyncio.run(_run())
     assert status == "complete", f"expected complete, got {status}"
     assert copied_count == 1
+
+
+def test_copy_single_topic_sends_messages_oldest_first() -> None:
+    """RED: bug #2 — iter_messages returns newest-first.
+
+    Destination must receive oldest-first. Messages with ids 3, 2, 1
+    in source must arrive at destination in order 1, 2, 3.
+    """
+    from telegram_mcp.tools.forum_forward import _copy_single_topic
+    from tests.fakes.telethon_client import FakeClient, FakeMessage, FakeUpdates
+
+    updates = FakeUpdates(updates=[_make_fake_update(999)])
+    client = FakeClient(
+        create_topic_result=updates,
+        topic_messages={
+            1: [
+                FakeMessage(id=1, message="oldest"),
+                FakeMessage(id=2, message="middle"),
+                FakeMessage(id=3, message="newest"),
+            ]
+        },
+    )
+
+    async def _run() -> None:
+        from types import SimpleNamespace
+
+        src_topic = SimpleNamespace(id=1, title="My Topic")
+        await _copy_single_topic(
+            client,
+            from_entity="from",
+            to_entity="to",
+            source_topic=src_topic,
+            target_topics_map={},
+            delay=0.0,
+            force=False,
+        )
+
+    asyncio.run(_run())
+    sent_texts = [m["text"] for m in client.sent_messages]
+    assert sent_texts == ["oldest", "middle", "newest"], f"Expected oldest-first, got {sent_texts}"

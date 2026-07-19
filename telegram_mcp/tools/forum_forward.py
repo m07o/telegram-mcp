@@ -82,7 +82,14 @@ async def _copy_single_topic(
     copied = 0
     failed = 0
 
+    # Collect all messages first, then reverse so we send oldest-first.
+    # Telethon's iter_messages returns newest-first by default.
+    msgs: list = []
     async for msg in client.iter_messages(from_entity, reply_to=topic_id):
+        msgs.append(msg)
+    msgs.reverse()  # Oldest first — matches the original copy_topic behavior
+
+    for msg in msgs:
         if getattr(msg, "action", None):
             continue
 
