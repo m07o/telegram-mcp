@@ -37,6 +37,7 @@ from telethon.tl import types
 
 from telegram_mcp.forum_pagination import (
     ChatLike,
+    extract_created_topic_id,
     iter_forum_topics,
     list_forum_topics,
 )
@@ -120,35 +121,28 @@ async def copy_single_topic(
     if title in target_topics_map and not force:
         return (topic_id, title, "exists", "already in target", source_count, 0)
 
-    if title in target_topics_map and force:
-        target_topic_id: int = target_topics_map[title]
-    else:
-        create_result = await client(
-            functions.messages.CreateForumTopicRequest(
-                peer=to_entity,
-                title=title,
-                random_id=secrets.randbits(63),
-            )
+    # When force=True OR title is not in target, create a fresh topic.
+    # Per design: force means "re-copy by creating a new topic with the
+    # same title" — we do NOT merge into the existing one.
+    create_result = await client(
+        functions.messages.CreateForumTopicRequest(
+            peer=to_entity,
+            title=title,
+            random_id=secrets.randbits(63),
         )
+    )
 
-        messages_attr = getattr(create_result, "messages", None)
-        if messages_attr:
-            target_topic_id = -1
-            for msg in messages_attr:
-                if hasattr(msg, "id"):
-                    target_topic_id = int(msg.id)
-                    break
-            if target_topic_id == -1:
-                return (
-                    topic_id,
-                    title,
-                    "failed",
-                    "could not get target topic id",
-                    source_count,
-                    0,
-                )
-        else:
-            return (topic_id, title, "failed", "no messages in create result", source_count, 0)
+    extracted = extract_created_topic_id(create_result)
+    if extracted is None or extracted < 1:
+        return (
+            topic_id,
+            title,
+            "failed",
+            "could not extract target topic id",
+            source_count,
+            0,
+        )
+    target_topic_id = extracted
 
     copied = 0
     failed = 0
