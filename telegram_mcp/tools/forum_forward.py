@@ -30,7 +30,7 @@ from telegram_mcp.runtime import (
     with_account,
 )
 
-SKIP_PATTERNS: set[str] = {".", "===", "@"}
+SKIP_PATTERNS: set[str] = {".", "===", "/", "@"}
 
 
 async def _build_title_to_id_map(

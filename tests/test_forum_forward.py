@@ -170,3 +170,43 @@ def test_copy_single_topic_sends_messages_oldest_first() -> None:
     asyncio.run(_run())
     sent_texts = [m["text"] for m in client.sent_messages]
     assert sent_texts == ["oldest", "middle", "newest"], f"Expected oldest-first, got {sent_texts}"
+
+
+def test_copy_single_topic_skips_bare_slash_message() -> None:
+    """RED: bug #3 — '/' not in SKIP_PATTERNS, so a bare '/' would be copied.
+
+    A bare slash sent to a destination with bot commands enabled could
+    misfire. Must be skipped like the other trivial patterns.
+    """
+    from telegram_mcp.tools.forum_forward import _copy_single_topic
+    from tests.fakes.telethon_client import FakeClient, FakeMessage, FakeUpdates
+
+    updates = FakeUpdates(updates=[_make_fake_update(777)])
+    client = FakeClient(
+        create_topic_result=updates,
+        topic_messages={
+            1: [
+                FakeMessage(id=1, message="/"),
+                FakeMessage(id=2, message="real content"),
+            ]
+        },
+    )
+
+    async def _run() -> None:
+        from types import SimpleNamespace
+
+        src_topic = SimpleNamespace(id=1, title="T")
+        await _copy_single_topic(
+            client,
+            from_entity="from",
+            to_entity="to",
+            source_topic=src_topic,
+            target_topics_map={},
+            delay=0.0,
+            force=False,
+        )
+
+    asyncio.run(_run())
+    sent_texts = [m["text"] for m in client.sent_messages]
+    assert "/" not in sent_texts, f"bare slash should be skipped, got {sent_texts}"
+    assert sent_texts == ["real content"]
