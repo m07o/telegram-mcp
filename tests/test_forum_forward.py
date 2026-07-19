@@ -7,6 +7,8 @@ from pathlib import Path
 
 from telegram_mcp.job_store import JobStore, JobProgress
 
+from tests.fakes.telethon_client import FakeClient, FakeMessage, FakeUpdates
+
 
 def test_forward_tool_persists_progress(tmp_path: Path) -> None:
     store = JobStore(base_dir=tmp_path / "jobs")
@@ -30,19 +32,3 @@ def test_forward_tool_resume_skips(tmp_path: Path) -> None:
     copied = {int(k) for k in p2.copied_topics.keys()}
     assert 10 in copied
     assert 11 in copied  # partial also counted as "handled"
-
-
-def test_forward_tool_summary_shape() -> None:
-    summary = {
-        "job_id": "fwd_abc",
-        "total": 10,
-        "copied": 8,
-        "partial": 1,
-        "skipped": 0,
-        "failed": 1,
-    }
-    assert "job_id" in summary
-    assert (
-        summary["copied"] + summary["partial"] + summary["skipped"] + summary["failed"]
-        == summary["total"]
-    )
