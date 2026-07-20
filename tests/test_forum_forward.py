@@ -326,6 +326,46 @@ def test_forward_topics_rejects_non_forum_chat(
     assert "forum" in result.lower(), f"expected 'forum' in error, got: {result}"
 
 
+def test_copy_single_topic_source_count_excludes_skipped_patterns() -> None:
+    """source_count must exclude messages that would be skipped
+    (bare patterns like '/'). Otherwise status wrongly reports 'partial'
+    for fully-copied topics that contained a single skipped outlier."""
+    from telegram_mcp.tools.forum_forward import _copy_single_topic
+    from tests.fakes.telethon_client import FakeClient, FakeMessage, FakeUpdates
+
+    updates = FakeUpdates(updates=[_make_fake_update(7777)])
+    client = FakeClient(
+        create_topic_result=updates,
+        topic_messages={
+            1: [
+                FakeMessage(id=1, message="real msg 1"),
+                FakeMessage(id=2, message="/"),  # skip pattern
+                FakeMessage(id=3, message="real msg 2"),
+            ]
+        },
+    )
+
+    async def _run() -> tuple[int, str, str, int, int]:
+        from types import SimpleNamespace
+
+        return await _copy_single_topic(
+            client,
+            from_entity="from",
+            to_entity="to",
+            source_topic=SimpleNamespace(id=1, title="T"),
+            target_topics_map={},
+            delay=0.0,
+            force=False,
+        )
+
+    _, _, status, source_count, copied_count = asyncio.run(_run())
+    sent = [m["text"] for m in client.sent_messages]
+    assert source_count == 2, f"expected 2 (excluding skipped), got {source_count}"
+    assert copied_count == 2
+    assert status == "complete", f"expected complete, got {status}"
+    assert "/" not in sent
+
+
 def test_copy_single_topic_force_creates_fresh_topic_not_appends() -> None:
     """RED: bug — force=True currently uses the existing target topic_id.
 

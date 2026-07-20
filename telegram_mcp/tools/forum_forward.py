@@ -78,9 +78,17 @@ async def _copy_single_topic(
     topic_id: int = source_topic.id
     title: str = source_topic.title
 
+    # Count messages that should be copied (excluding service messages and
+    # patterns that the copy loop will also skip). Otherwise a topic with
+    # one bare '/' would always be reported 'partial'.
     source_count = 0
     async for _msg in client.iter_messages(from_entity, reply_to=topic_id):
         if getattr(_msg, "action", None):
+            continue
+        raw_text = getattr(_msg, "message", None) or ""
+        if raw_text.strip() in SKIP_PATTERNS and not getattr(_msg, "media", None):
+            continue
+        if raw_text.strip() and re.match(r"^/\w+@\w+", raw_text.strip()):
             continue
         source_count += 1
 
@@ -274,6 +282,11 @@ async def forward_topics_from_group(
                         error="could not create target topic",
                     )
 
+                # Update the in-memory title map if we just created a new
+                # topic, so subsequent topics see it without re-paginating.
+                if status in ("complete", "partial"):
+                    target_titles[title] = copied_count  # not the real id; just a presence mark
+
                 store.save(progress)
             except Exception as e:
                 logger.warning("Failed to process topic %s: %s", topic.id, e)
@@ -282,8 +295,6 @@ async def forward_topics_from_group(
                     progress, topic_id=topic.id, title=title, error=str(e)[:200]
                 )
                 store.save(progress)
-
-            target_titles = await _build_title_to_id_map(cl, to_entity)
 
         duration = time.monotonic() - start_time
         summary = {
