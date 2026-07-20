@@ -13,10 +13,13 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/).
 - `count_topics` MCP tool — returns the TRUE total topic count (paginating past 100-per-request limit), so AI agents don't truncate at the page boundary.
 - `copy_topics.py` — standalone CLI for topic copying with `--check`, `--resume`, `--fix-incomplete` modes.
 - `edit_forum_topic` MCP tool — edit a forum topic's title, icon, close/reopen, or hide/unhide in a single call. None leaves the field unchanged.
+- `close_forum_topic` / `reopen_forum_topic` / `hide_forum_topic` / `unhide_forum_topic` MCP tools — thin wrappers around `edit_forum_topic`.
+- `delete_topic` MCP tool — deletes every message in a topic (revoke=True) and hides the tab. Mirrors the Telegram mobile convention; there is no single RPC for forum-topic deletion in the Telegram API.
+- `ban_users_bulk` / `unban_users_bulk` MCP tools — bulk admin actions that wrap `EditBannedRequest` per user and surface per-user failures in a JSON summary.
 - mypy configuration (advisory mode) in `pyproject.toml`.
 - Type hints for `copy_topics.py` and `session_string_generator.py`.
 - `tests/fakes/telethon_client.py` — fake Telethon client with scripted responses for integration tests.
-- Tests for `extract_created_topic_id`, `count_topics`, `_validate_forum_entities`, `_copy_single_topic` (id extraction, message order, skip patterns, service messages, prompt-injection safety, `force=True` semantics), `edit_forum_topic` (12 tests covering title/closed/hidden/icon edits, validations, and rejection paths).
+- Tests for `extract_created_topic_id`, `count_topics`, `_validate_forum_entities`, `_copy_single_topic` (id extraction, message order, skip patterns, service messages, prompt-injection safety, `force=True` semantics), `edit_forum_topic` (12 tests covering title/closed/hidden/icon edits, validations, and rejection paths), `close/reopen/hide/unhide_forum_topic` aliases (5 delegation tests), `delete_topic` (4 tests covering empty/non-empty topic, validation paths, and the messages-then-hide sequence), `ban_users_bulk`/`unban_users_bulk` (5 tests including partial-failure handling).
 
 ### Changed
 - `list_topics` tool: added `fetch_all` parameter to paginate past the 100-topic Telegram limit.

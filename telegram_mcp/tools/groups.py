@@ -1503,3 +1503,137 @@ async def delete_topic(
             chat_id=chat_id,
             topic_id=topic_id,
         )
+
+
+async def _run_bulk_admin(
+    chat_id: Union[int, str],
+    user_ids: list[Union[int, str]],
+    banned_rights: "ChatBannedRights",
+    *,
+    action: str,
+    account: Optional[str] = None,
+) -> str:
+    """Iterate ``user_ids``, ban or unban each, return JSON summary."""
+    cl = get_client(account if account is not None else "")
+    chat = await resolve_entity(chat_id, cl)
+
+    if not getattr(chat, "megagroup", False):
+        return "The specified chat is not a supergroup."
+
+    succeeded: list[Union[int, str]] = []
+    failed: list[dict[str, Any]] = []
+
+    from telethon.tl.functions.channels import EditBannedRequest
+
+    for uid in user_ids:
+        try:
+            user = await resolve_entity(uid, cl)
+            await cl(
+                EditBannedRequest(
+                    channel=chat,
+                    participant=user,
+                    banned_rights=banned_rights,
+                )
+            )
+            succeeded.append(uid)
+        except Exception as exc:
+            failed.append({"id": uid, "error": str(exc)[:200]})
+
+    return json.dumps(
+        {action: succeeded, "failed": failed},
+        ensure_ascii=False,
+    )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Ban Users Bulk",
+        openWorldHint=True,
+        destructiveHint=True,
+    )
+)
+@with_account(readonly=False)
+@validate_id("chat_id", "user_ids")
+async def ban_users_bulk(
+    chat_id: Union[int, str],
+    user_ids: list[Union[int, str]],
+    account: Optional[str] = None,
+) -> str:
+    """Ban every user in ``user_ids`` from a supergroup.
+
+    Each user is banned via ``EditBannedRequest`` (the Telegram API only
+    accepts a single participant per request). Returns JSON with two
+    keys:
+
+      - ``banned``: list of user ids that were banned successfully
+      - ``failed``: list of ``{id, error}`` entries for users whose ban
+        was rejected (e.g. permissions error, flood wait, not a member)
+
+    Use ``unban_users_bulk`` to lift bans.
+    """
+    from telethon.tl.types import ChatBannedRights
+
+    banned_rights = ChatBannedRights(
+        until_date=None,
+        view_messages=True,
+        send_messages=True,
+        send_media=True,
+        send_stickers=True,
+        send_gifs=True,
+        send_games=True,
+        send_inline=True,
+        embed_links=True,
+        send_polls=True,
+        change_info=True,
+        invite_users=True,
+        pin_messages=True,
+    )
+    try:
+        return await _run_bulk_admin(
+            chat_id, user_ids, banned_rights, action="banned", account=account
+        )
+    except Exception as exc:
+        return log_and_format_error("ban_users_bulk", exc, chat_id=chat_id)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Unban Users Bulk",
+        openWorldHint=True,
+        destructiveHint=False,
+    )
+)
+@with_account(readonly=False)
+@validate_id("chat_id", "user_ids")
+async def unban_users_bulk(
+    chat_id: Union[int, str],
+    user_ids: list[Union[int, str]],
+    account: Optional[str] = None,
+) -> str:
+    """Lift bans for every user in ``user_ids`` from a supergroup.
+
+    Returns JSON with ``unbanned`` (succeeded) and ``failed`` arrays.
+    """
+    from telethon.tl.types import ChatBannedRights
+
+    unbanned_rights = ChatBannedRights(
+        until_date=None,
+        view_messages=False,
+        send_messages=False,
+        send_media=False,
+        send_stickers=False,
+        send_gifs=False,
+        send_games=False,
+        send_inline=False,
+        embed_links=False,
+        send_polls=False,
+        change_info=False,
+        invite_users=False,
+        pin_messages=False,
+    )
+    try:
+        return await _run_bulk_admin(
+            chat_id, user_ids, unbanned_rights, action="unbanned", account=account
+        )
+    except Exception as exc:
+        return log_and_format_error("unban_users_bulk", exc, chat_id=chat_id)
