@@ -22,6 +22,7 @@ from telegram_mcp.forum_pagination import (
 )
 from telegram_mcp.job_store import JobProgress, JobStore, generate_job_id
 from telegram_mcp.runtime import (
+    ToolAnnotations,
     get_client,
     log_and_format_error,
     mcp,
@@ -85,10 +86,10 @@ async def _copy_single_topic(
     async for _msg in client.iter_messages(from_entity, reply_to=topic_id):
         if getattr(_msg, "action", None):
             continue
-        raw_text = getattr(_msg, "message", None) or ""
-        if raw_text.strip() in SKIP_PATTERNS and not getattr(_msg, "media", None):
+        _raw_text = getattr(_msg, "message", None) or ""
+        if _raw_text.strip() in SKIP_PATTERNS and not getattr(_msg, "media", None):
             continue
-        if raw_text.strip() and re.match(r"^/\w+@\w+", raw_text.strip()):
+        if _raw_text.strip() and re.match(r"^/\w+@\w+", _raw_text.strip()):
             continue
         source_count += 1
 
@@ -162,7 +163,7 @@ async def _copy_single_topic(
 
 
 @mcp.tool(
-    annotations=dict(
+    annotations=ToolAnnotations(
         title="Forward Topics From Group",
         openWorldHint=True,
         destructiveHint=True,
@@ -204,7 +205,7 @@ async def forward_topics_from_group(
     instructions.
     """
     try:
-        cl = get_client(account)
+        cl = get_client(account if account is not None else "")
         from_entity = await resolve_entity(from_chat_id, cl)
         to_entity = await resolve_entity(to_chat_id, cl)
 
