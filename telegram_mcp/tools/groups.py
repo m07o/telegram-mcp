@@ -1330,3 +1330,95 @@ async def edit_forum_topic(
             chat_id=chat_id,
             topic_id=topic_id,
         )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Close Forum Topic",
+        openWorldHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+    )
+)
+@with_account(readonly=False)
+@validate_id("chat_id")
+async def close_forum_topic(
+    chat_id: Union[int, str],
+    topic_id: int,
+    account: Optional[str] = None,
+) -> str:
+    """Close a forum topic so no one (except admins) can post in it.
+
+    Thin wrapper around ``edit_forum_topic(closed=True)``.
+    Returns the underlying tool's status string.
+    """
+    return await edit_forum_topic(chat_id, topic_id, closed=True, account=account)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Reopen Forum Topic",
+        openWorldHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+    )
+)
+@with_account(readonly=False)
+@validate_id("chat_id")
+async def reopen_forum_topic(
+    chat_id: Union[int, str],
+    topic_id: int,
+    account: Optional[str] = None,
+) -> str:
+    """Reopen a previously closed forum topic.
+
+    Thin wrapper around ``edit_forum_topic(closed=False)``.
+    Returns the underlying tool's status string.
+    """
+    return await edit_forum_topic(chat_id, topic_id, closed=False, account=account)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Hide Forum Topic",
+        openWorldHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+    )
+)
+@with_account(readonly=False)
+@validate_id("chat_id")
+async def hide_forum_topic(
+    chat_id: Union[int, str],
+    topic_id: int,
+    account: Optional[str] = None,
+) -> str:
+    """Hide a forum topic from the topic list (still visible to members who know it).
+
+    Thin wrapper around ``edit_forum_topic(hidden=True)``.
+    Returns the underlying tool's status string.
+    """
+    return await edit_forum_topic(chat_id, topic_id, hidden=True, account=account)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Unhide Forum Topic",
+        openWorldHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+    )
+)
+@with_account(readonly=False)
+@validate_id("chat_id")
+async def unhide_forum_topic(
+    chat_id: Union[int, str],
+    topic_id: int,
+    account: Optional[str] = None,
+) -> str:
+    """Unhide a previously hidden forum topic so it shows again in the topic list.
+
+    Thin wrapper around ``edit_forum_topic(hidden=False)``.
+    Returns the underlying tool's status string.
+    """
+    return await edit_forum_topic(chat_id, topic_id, hidden=False, account=account)
