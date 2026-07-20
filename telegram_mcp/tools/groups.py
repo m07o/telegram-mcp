@@ -1422,3 +1422,84 @@ async def unhide_forum_topic(
     Returns the underlying tool's status string.
     """
     return await edit_forum_topic(chat_id, topic_id, hidden=False, account=account)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Delete Forum Topic",
+        openWorldHint=True,
+        destructiveHint=True,
+    )
+)
+@with_account(readonly=False)
+@validate_id("chat_id")
+async def delete_topic(
+    chat_id: Union[int, str],
+    topic_id: int,
+    account: Optional[str] = None,
+) -> str:
+    """Delete a forum topic.
+
+    The Telegram API does NOT expose a single RPC for this; mobile clients
+    implement deletion as a two-step convention which this tool mirrors:
+
+      1. Delete every message currently in the topic (revoke=True so other
+         clients don't see them either).
+      2. Hide the topic from the topic tab bar (so it won't distract the
+         remaining members).
+
+    Args:
+        chat_id: Forum-enabled supergroup (id or @username).
+        topic_id: The topic to delete.
+        account: Optional account label.
+
+    Note: A new topic with the same title can still be created afterwards
+    -- there is no API to "kill the title". Use create_forum_topic for that.
+    """
+    try:
+        cl = get_client(account if account is not None else "")
+        entity = await resolve_entity(chat_id, cl)
+
+        err = _validate_topic_target(entity)
+        if err:
+            return err
+
+        # Step 1: gather all message ids in the topic.
+        msg_ids: list[int] = []
+        async for _msg in cl.iter_messages(entity, reply_to=topic_id):
+            msg_id = getattr(_msg, "id", None)
+            if isinstance(msg_id, int):
+                msg_ids.append(msg_id)
+
+        if msg_ids:
+            from telethon.tl.functions.messages import DeleteMessagesRequest
+
+            await cl(DeleteMessagesRequest(id=msg_ids, revoke=True))
+
+        # Step 2: hide the topic so it won't keep appearing in the tabs.
+        from telethon.tl.functions.messages import EditForumTopicRequest
+
+        await cl(
+            EditForumTopicRequest(
+                peer=entity,
+                topic_id=topic_id,
+                title=None,
+                icon_emoji_id=None,
+                closed=None,
+                hidden=True,
+            )
+        )
+
+        summary = {
+            "topic_id": topic_id,
+            "messages_deleted": len(msg_ids),
+            "hidden": True,
+        }
+        return json.dumps(summary, ensure_ascii=False)
+    except Exception as exc:
+        return log_and_format_error(
+            "delete_topic",
+            exc,
+            chat_id=chat_id,
+            topic_id=topic_id,
+        )

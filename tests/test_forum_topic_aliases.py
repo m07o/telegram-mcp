@@ -35,9 +35,7 @@ def _capture(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         captured["account"] = account
         return "ok"
 
-    monkeypatch.setattr(
-        "telegram_mcp.tools.groups.edit_forum_topic", fake_edit_forum_topic
-    )
+    monkeypatch.setattr("telegram_mcp.tools.groups.edit_forum_topic", fake_edit_forum_topic)
     return captured
 
 
