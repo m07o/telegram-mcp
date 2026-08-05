@@ -4,8 +4,8 @@
 
 ![MCP Badge](https://badge.mcpx.dev)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-green?style=flat-square)](https://opensource.org/licenses/Apache-2.0)
-[![Python Lint & Format Check](https://github.com/chigwell/telegram-mcp/actions/workflows/python-lint-format.yml/badge.svg)](https://github.com/chigwell/telegram-mcp/actions/workflows/python-lint-format.yml)
-[![Docker Build & Compose Validation](https://github.com/chigwell/telegram-mcp/actions/workflows/docker-build.yml/badge.svg)](https://github.com/chigwell/telegram-mcp/actions/workflows/docker-build.yml)
+[![Python Lint & Format Check](https://github.com/<YOUR_FORK_ORG>/<YOUR_FORK_REPO>/actions/workflows/python-lint-format.yml/badge.svg)](https://github.com/<YOUR_FORK_ORG>/<YOUR_FORK_REPO>/actions/workflows/python-lint-format.yml)
+[![Docker Build & Compose Validation](https://github.com/<YOUR_FORK_ORG>/<YOUR_FORK_REPO>/actions/workflows/docker-build.yml/badge.svg)](https://github.com/<YOUR_FORK_ORG>/<YOUR_FORK_REPO>/actions/workflows/docker-build.yml)
 
 A Telegram integration for Claude, Cursor, and other MCP-compatible clients. It exposes Telegram account, chat, message, contact, media, folder, and admin operations through the [Model Context Protocol](https://modelcontextprotocol.io/) using [Telethon](https://docs.telethon.dev/).
 
@@ -72,7 +72,7 @@ All tool results that include Telegram user-controlled content are sanitized and
 ### 1. Clone and Install
 
 ```bash
-git clone https://github.com/chigwell/telegram-mcp.git
+git clone https://github.com/<YOUR_FORK_ORG>/<YOUR_FORK_REPO>.git
 cd telegram-mcp
 uv sync
 ```
@@ -173,7 +173,7 @@ environment using a specific release tag or commit:
 ```bash
 python -m venv .venv
 . .venv/bin/activate
-pip install "git+https://github.com/chigwell/telegram-mcp.git@<tag-or-commit>"
+pip install "git+https://github.com/<YOUR_FORK_ORG>/<YOUR_FORK_REPO>.git@<tag-or-commit>"
 ```
 
 Then configure your MCP client to run the installed console script:
@@ -197,7 +197,7 @@ Generate a session string without cloning the repo by sourcing this repository
 from GitHub explicitly:
 
 ```bash
-uvx --from "git+https://github.com/chigwell/telegram-mcp.git@<pinned-release-tag-or-commit>" telegram-mcp-generate-session
+uvx --from "git+https://github.com/<YOUR_FORK_ORG>/<YOUR_FORK_REPO>.git@<pinned-release-tag-or-commit>" telegram-mcp-generate-session
 ```
 
 ### Transports
@@ -535,9 +535,9 @@ This project is licensed under the [Apache 2.0 License](LICENSE).
 - [Telethon](https://github.com/LonamiWebs/Telethon)
 - [Model Context Protocol](https://modelcontextprotocol.io/)
 - [Claude](https://www.anthropic.com/) and [Cursor](https://cursor.so/)
-- [chigwell/telegram-mcp](https://github.com/chigwell/telegram-mcp) upstream project
+- [chigwell/telegram-mcp](https://github.com/chigwell/telegram-mcp) — upstream project this fork is built on top of
 
-Maintained by [@chigwell](https://github.com/chigwell) and [@l1v0n1](https://github.com/l1v0n1). PRs welcome.
+PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development workflow.
 
 ## Star History
 
@@ -545,6 +545,6 @@ Maintained by [@chigwell](https://github.com/chigwell) and [@l1v0n1](https://git
 
 ## Contributors
 
-<a href="https://github.com/chigwell/telegram-mcp/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=chigwell/telegram-mcp" />
+<a href="https://github.com/<YOUR_FORK_ORG>/<YOUR_FORK_REPO>/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=<YOUR_FORK_ORG>/<YOUR_FORK_REPO>" />
 </a>

@@ -902,8 +902,7 @@ If you discover a security vulnerability in this project, please report it respo
 **Do NOT open a public GitHub issue for security vulnerabilities.**
 
 Instead, email the maintainers directly:
-- [@chigwell](https://github.com/chigwell)
-- [@l1v0n1](https://github.com/l1v0n1)
+- See the fork repository's [GitHub maintainers page](https://github.com/<YOUR_FORK_ORG>/<YOUR_FORK_REPO>/blob/main/MAINTAINERS.md) for current contact details.
 
 Include:
 - Description of the vulnerability
