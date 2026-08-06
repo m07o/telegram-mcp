@@ -1215,23 +1215,41 @@ async def copy_topic(
             topic_title = f"topic_{topic_id}"
         clean_title = sanitize_user_content(topic_title, max_length=128)
 
-        # Check if topic already exists in target
-        existing_topics = {}
+        # Check if topic already exists in target (with pagination for all topics)
+        existing_topics: dict[str, list[int]] = {}
         try:
-            topics_res = await cl(
-                functions.messages.GetForumTopicsRequest(
-                    peer=to_entity, offset_date=0, offset_id=0, offset_topic=0, limit=100
+            current_offset = 0
+            page_limit = 100
+            while True:
+                topics_res = await cl(
+                    GetForumTopicsRequest(
+                        channel=to_entity,
+                        offset_date=0,
+                        offset_id=0,
+                        offset_topic=current_offset,
+                        limit=page_limit,
+                        q=None,
+                    )
                 )
-            )
-            for t in getattr(topics_res, "topics", []) or []:
-                if hasattr(t, "title") and t.title:
-                    existing_topics[t.title] = t.id
+                topics = getattr(topics_res, "topics", []) or []
+                if not topics:
+                    break
+
+                for t in topics:
+                    if hasattr(t, "title") and t.title:
+                        existing_topics.setdefault(t.title, []).append(t.id)
+
+                if len(topics) < page_limit:
+                    break
+                current_offset = topics[-1].id
+                await _asyncio.sleep(0.5)
         except Exception:
             pass
 
         # Get or create target topic
         if clean_title in existing_topics:
-            target_topic_id = existing_topics[clean_title]
+            # Use the FIRST (oldest) topic ID when duplicates exist
+            target_topic_id = existing_topics[clean_title][0]
         else:
             create_result = await cl(
                 CreateForumTopicRequest(
@@ -1256,6 +1274,8 @@ async def copy_topic(
         msgs.reverse()  # Oldest first
 
         # Copy messages
+        # Skip patterns that are typically separators/placeholders, not real content.
+        # Only skip if exact match, no media, and no formatting entities (likely system msgs).
         SKIP_PATTERNS = {".", "===", "/", "@"}
         copied = 0
         failed = 0
@@ -1264,10 +1284,15 @@ async def copy_topic(
         for msg in msgs:
             try:
                 raw_text = getattr(msg, "message", None) or ""
-                if raw_text.strip() in SKIP_PATTERNS and not getattr(msg, "media", None):
+                stripped = raw_text.strip()
+                has_media = getattr(msg, "media", None) is not None
+                has_entities = bool(getattr(msg, "entities", None))
+                # Skip only if exact match, no media, no entities (likely placeholder/separator)
+                if not has_media and not has_entities and stripped in SKIP_PATTERNS:
                     skipped += 1
                     continue
-                if raw_text.strip() and _re.match(r"^/\w+@\w+", raw_text.strip()):
+                # Skip bare bot commands like '/start@botname' (no media, no other text)
+                if not has_media and _re.fullmatch(r"/\w+@\w+", stripped):
                     skipped += 1
                     continue
 
