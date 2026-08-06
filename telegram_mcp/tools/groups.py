@@ -101,7 +101,7 @@ async def invite_to_group(
 
         try:
             result = await cl(
-                functions.channels.InviteToChannelRequest(channel=entity, users=users_to_add)
+                functions.channels.InviteToChannelRequest(peer=entity, users=users_to_add)
             )
 
             invited_count = 0
@@ -150,7 +150,7 @@ async def leave_chat(chat_id: Union[int, str], account: str = None) -> str:
         if isinstance(entity, Channel):
             # Handle both channels and supergroups (which are also channels in Telegram)
             try:
-                await cl(functions.channels.LeaveChannelRequest(channel=entity))
+                await cl(functions.channels.LeaveChannelRequest(peer=entity))
                 chat_name = sanitize_name(getattr(entity, "title", str(chat_id)))
                 return f"Left channel/supergroup {chat_name} (ID: {chat_id})."
             except Exception as chan_err:
@@ -322,7 +322,7 @@ async def edit_chat_title(chat_id: Union[int, str], title: str, account: str = N
         cl = get_client(account)
         entity = await resolve_entity(chat_id, cl)
         if isinstance(entity, Channel):
-            await cl(functions.channels.EditTitleRequest(channel=entity, title=title))
+            await cl(functions.channels.EditTitleRequest(peer=entity, title=title))
         elif isinstance(entity, Chat):
             await cl(functions.messages.EditChatTitleRequest(chat_id=chat_id, title=title))
         else:
@@ -365,7 +365,7 @@ async def edit_chat_photo(
         if isinstance(entity, Channel):
             # For channels/supergroups, use EditPhotoRequest with InputChatUploadedPhoto
             input_photo = InputChatUploadedPhoto(file=uploaded_file)
-            await cl(functions.channels.EditPhotoRequest(channel=entity, photo=input_photo))
+            await cl(functions.channels.EditPhotoRequest(peer=entity, photo=input_photo))
         elif isinstance(entity, Chat):
             # For basic groups, use EditChatPhotoRequest with InputChatUploadedPhoto
             input_photo = InputChatUploadedPhoto(file=uploaded_file)
@@ -430,9 +430,7 @@ async def delete_chat_photo(chat_id: Union[int, str], account: str = None) -> st
         entity = await resolve_entity(chat_id, cl)
         if isinstance(entity, Channel):
             # Use InputChatPhotoEmpty for channels/supergroups
-            await cl(
-                functions.channels.EditPhotoRequest(channel=entity, photo=InputChatPhotoEmpty())
-            )
+            await cl(functions.channels.EditPhotoRequest(peer=entity, photo=InputChatPhotoEmpty()))
         elif isinstance(entity, Chat):
             # Use None (or InputChatPhotoEmpty) for basic groups
             await cl(
@@ -810,7 +808,7 @@ async def toggle_slow_mode(chat_id: Union[int, str], seconds: int = 0, account: 
         entity = await resolve_entity(chat_id, cl)
         if not isinstance(entity, Channel) or not getattr(entity, "megagroup", False):
             return "Error: slow mode is only supported for supergroups."
-        await cl(functions.channels.ToggleSlowModeRequest(channel=entity, seconds=seconds))
+        await cl(functions.channels.ToggleSlowModeRequest(peer=entity, seconds=seconds))
         if seconds == 0:
             return f"Slow mode disabled for chat {chat_id}."
         return f"Slow mode enabled for chat {chat_id} (interval: {seconds}s)."
@@ -894,7 +892,7 @@ async def edit_admin_rights(
         )
         await cl(
             functions.channels.EditAdminRequest(
-                channel=entity, user_id=user, admin_rights=admin_rights, rank=rank
+                peer=entity, user_id=user, admin_rights=admin_rights, rank=rank
             )
         )
         return f"Admin rights updated for user {user_id} in chat {chat_id}."
@@ -1637,3 +1635,520 @@ async def unban_users_bulk(
         )
     except Exception as exc:
         return log_and_format_error("unban_users_bulk", exc, chat_id=chat_id)
+
+
+async def _fetch_topic_messages(
+    client: Any,
+    entity: Any,
+    topic_id: int,
+    *,
+    limit: int = 5,
+) -> list:
+    """Fetch a small sample of messages from a forum topic.
+
+    Returns up to `limit` messages (first and last, most recent) for content sampling.
+    """
+    samples = []
+    try:
+        # Fetch first few (oldest)
+        async for msg in client.iter_messages(
+            entity, reply_to=topic_id, reverse=True, limit=limit
+        ):
+            text = getattr(msg, "message", None) or ""
+            samples.append(
+                {
+                    "id": msg.id,
+                    "text": (text[:256] + "...") if len(text) > 256 else text,
+                    "has_media": getattr(msg, "media", None) is not None,
+                    "date_iso": msg.date.isoformat() if getattr(msg, "date", None) else None,
+                }
+            )
+            if len(samples) >= limit:
+                break
+
+        # If we need more, fetch the most recent
+        if len(samples) < limit:
+            recent = []
+            async for msg in client.iter_messages(
+                entity, reply_to=topic_id, reverse=False, limit=limit
+            ):
+                if msg.id not in [s["id"] for s in samples]:
+                    text = getattr(msg, "message", None) or ""
+                    recent.append(
+                        {
+                            "id": msg.id,
+                            "text": (
+                                (msg.message[:256] + "...")
+                                if len(msg.message) > 256
+                                else msg.message
+                            ),
+                            "has_media": getattr(msg, "media", None) is not None,
+                            "date_iso": (
+                                msg.date.isoformat() if getattr(msg, "date", None) else None
+                            ),
+                        }
+                    )
+                    if len(samples) + len(recent) >= limit:
+                        break
+            samples.extend(recent)
+
+    except Exception:
+        pass  # Sampling is best-effort
+
+    return samples[:limit]
+
+
+def _topic_to_summary(topic: Any, message_samples: list | None = None) -> Any:
+    """Convert a raw Telethon ForumTopic to a ForumTopicSummary for analysis."""
+    from telegram_mcp.group_analysis import ForumTopicSummary, MessageSample
+
+    # Build message samples from passed data
+    samples = []
+    if message_samples:
+        samples = [
+            MessageSample(
+                id=s.get("id", 0),
+                text=s.get("text", ""),
+                has_media=s.get("has_media", False),
+                date_iso=s.get("date_iso"),
+            )
+            for s in message_samples
+        ]
+
+    return ForumTopicSummary(
+        id=getattr(topic, "id", 0),
+        title=getattr(topic, "title", ""),
+        total_messages=getattr(topic, "total_messages", 0),
+        last_activity_iso=getattr(topic, "top_message", None),
+        icon_emoji_id=getattr(topic, "icon_emoji_id", None),
+        hidden=getattr(topic, "hidden", False),
+        closed=getattr(topic, "closed", False),
+        description=getattr(topic, "description", None),
+        message_samples=samples,
+    )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Analyze Group",
+        readOnlyHint=True,
+        openWorldHint=True,
+    )
+)
+@with_account(readonly=True)
+@validate_id("chat_id")
+async def analyze_group(
+    chat_id: Union[int, str],
+    *,
+    mode: str = "summary",
+    inactivity_days: int = 90,
+    account: Optional[str] = None,
+) -> str:
+    """
+    Comprehensive analysis of a forum-enabled supergroup.
+
+    Returns structured JSON with:
+    - summary_stats: total topics, messages, median/max/min messages per topic, p90
+    - duplicate topic groups (same normalized title)
+    - gaps: topics missing description, icon, or with very few messages
+    - dead topics: no activity for `inactivity_days` (default 90)
+
+    Modes:
+    - "summary" (default): only counts and summary text
+    - "detail": full arrays with topic_ids for immediate action
+
+    Args:
+        chat_id: The forum-enabled supergroup (id or @username).
+        mode: "summary" (default, low-token) or "detail" (full arrays).
+        inactivity_days: Threshold for dead topics (default 90, must be > 0).
+        account: Optional account label for multi-account mode.
+
+    Note: All finding entries include `topic_id` so the AI can take immediate action.
+    """
+    try:
+        cl = get_client(account if account is not None else "")
+        entity = await resolve_entity(chat_id, cl)
+
+        err = _validate_topic_target(entity)
+        if err:
+            return err
+
+        if mode not in ("summary", "detail"):
+            return "Invalid mode: must be 'summary' or 'detail'."
+
+        if inactivity_days <= 0:
+            return "inactivity_days must be > 0."
+
+        # Fetch all topics (paginated)
+        all_topics = []
+        offset_topic = 0
+        limit = 100
+
+        while True:
+            result = await cl(
+                functions.messages.GetForumTopicsRequest(
+                    peer=entity,
+                    offset_date=0,
+                    offset_id=0,
+                    offset_topic=offset_topic,
+                    limit=limit,
+                    q=None,
+                )
+            )
+            topics = getattr(result, "topics", None) or []
+            if not topics:
+                break
+
+            all_topics.extend(topics)
+
+            if len(topics) < limit:
+                break
+
+            offset_topic = topics[-1].id
+            await asyncio.sleep(0.5)  # rate limit
+
+        # Convert to summary objects
+        from telegram_mcp.group_analysis import (
+            ForumTopicSummary,
+            find_duplicate_forum_topics,
+            find_topic_gaps,
+            find_dead_forum_topics,
+            compute_topic_stats,
+            summarize_findings,
+        )
+
+        # In detail mode, fetch message samples for each topic
+        topic_summaries = []
+        topic_details = []  # for detail mode output
+        for t in all_topics:
+            samples = []
+            if mode == "detail":
+                samples = await _fetch_topic_messages(cl, entity, t.id, limit=5)
+            summary = _topic_to_summary(t, message_samples=samples)
+            topic_summaries.append(summary)
+            if mode == "detail":
+                topic_details.append(
+                    {
+                        "id": summary.id,
+                        "title": summary.title,
+                        "total_messages": summary.total_messages,
+                        "last_activity_iso": summary.last_activity_iso,
+                        "icon_emoji_id": summary.icon_emoji_id,
+                        "hidden": summary.hidden,
+                        "closed": summary.closed,
+                        "description": summary.description,
+                        "message_samples": samples,
+                    }
+                )
+
+        # Run analysis
+        stats = compute_topic_stats(topic_summaries)
+        duplicates = find_duplicate_forum_topics(topic_summaries)
+        gaps = find_topic_gaps(topic_summaries)
+        dead = find_dead_forum_topics(topic_summaries, inactivity_days=inactivity_days)
+
+        if mode == "summary":
+            summary_text = summarize_findings(
+                stats=stats,
+                duplicates=duplicates,
+                gaps=gaps,
+                dead_topics=dead,
+            )
+            result = {
+                "chat_id": getattr(entity, "id", chat_id),
+                "chat_title": getattr(entity, "title", str(chat_id)),
+                "summary_stats": {
+                    "total_topics": stats.total_topics,
+                    "total_messages": stats.total_messages,
+                    "median_messages_per_topic": stats.median_messages,
+                    "max_messages": stats.max_messages,
+                    "min_messages": stats.min_messages,
+                    "p90_messages": stats.p90_messages,
+                },
+                "findings": {
+                    "duplicate_topic_groups": len(duplicates),
+                    "topics_with_gaps": len(gaps),
+                    "dead_topics": len(dead),
+                },
+                "summary_text": summary_text,
+            }
+        else:
+            # Detail mode - include full arrays
+            result = {
+                "chat_id": getattr(entity, "id", chat_id),
+                "chat_title": getattr(entity, "title", str(chat_id)),
+                "summary_stats": {
+                    "total_topics": stats.total_topics,
+                    "total_messages": stats.total_messages,
+                    "median_messages_per_topic": stats.median_messages,
+                    "max_messages": stats.max_messages,
+                    "min_messages": stats.min_messages,
+                    "p90_messages": stats.p90_messages,
+                },
+                "duplicates": [
+                    {
+                        "normalized_title": d.normalized_title,
+                        "topic_ids": d.topic_ids,
+                        "original_titles": d.original_titles,
+                    }
+                    for d in duplicates
+                ],
+                "gaps": [
+                    {"kind": g.kind, "topic_id": g.topic_id, "detail": g.detail} for g in gaps
+                ],
+                "dead_topics": dead,
+                "topics": topic_details,
+            }
+
+        return json.dumps(result, ensure_ascii=False)
+
+    except Exception as e:
+        return log_and_format_error(
+            "analyze_group", e, chat_id=chat_id, inactivity_days=inactivity_days
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Export Analyze Group to Excel",
+        readOnlyHint=True,
+        openWorldHint=True,
+    )
+)
+@with_account(readonly=True)
+@validate_id("chat_id")
+async def export_analyze_group_excel(
+    chat_id: Union[int, str],
+    *,
+    inactivity_days: int = 90,
+    output_path: str,
+    account: Optional[str] = None,
+) -> str:
+    """
+    Run analyze_group in detail mode and export the results to an Excel (.xlsx) file.
+
+    The Excel workbook contains these sheets:
+    1. Summary - overall statistics and findings counts
+    2. Topics - per-topic details with message samples
+    3. Duplicates - duplicate topic groups
+    4. Gaps - topics missing description, icon, or with low activity
+    5. Dead Topics - inactive topic IDs
+
+    Args:
+        chat_id: The forum-enabled supergroup (id or @username).
+        inactivity_days: Threshold for dead topics (default 90, must be > 0).
+        output_path: Full path where the .xlsx file will be written.
+        account: Optional account label for multi-account mode.
+
+    Returns:
+        JSON string with success status and output path, or error message.
+
+    Note: Requires write access to output_path. The directory must exist.
+    """
+    try:
+        from telegram_mcp.analyze_export import write_analysis_to_excel
+
+        # Run analyze_group in detail mode internally
+        cl = get_client(account if account is not None else "")
+        entity = await resolve_entity(chat_id, cl)
+
+        err = _validate_topic_target(entity)
+        if err:
+            return err
+
+        if inactivity_days <= 0:
+            return "inactivity_days must be > 0."
+
+        # Fetch all topics (paginated)
+        all_topics = []
+        offset_topic = 0
+        limit = 100
+
+        while True:
+            result = await cl(
+                functions.messages.GetForumTopicsRequest(
+                    peer=entity,
+                    offset_date=0,
+                    offset_id=0,
+                    offset_topic=offset_topic,
+                    limit=limit,
+                    q=None,
+                )
+            )
+            topics = getattr(result, "topics", None) or []
+            if not topics:
+                break
+
+            all_topics.extend(topics)
+
+            if len(topics) < limit:
+                break
+
+            offset_topic = topics[-1].id
+            await asyncio.sleep(0.5)  # rate limit
+
+        # Convert to summary objects with message samples
+        from telegram_mcp.group_analysis import (
+            ForumTopicSummary,
+            find_duplicate_forum_topics,
+            find_topic_gaps,
+            find_dead_forum_topics,
+            compute_topic_stats,
+            summarize_findings,
+        )
+
+        topic_summaries = []
+        topic_details = []
+        for t in all_topics:
+            samples = await _fetch_topic_messages(cl, entity, t.id, limit=5)
+            summary = _topic_to_summary(t, message_samples=samples)
+            topic_summaries.append(summary)
+            topic_details.append(
+                {
+                    "id": summary.id,
+                    "title": summary.title,
+                    "total_messages": summary.total_messages,
+                    "last_activity_iso": summary.last_activity_iso,
+                    "icon_emoji_id": summary.icon_emoji_id,
+                    "hidden": summary.hidden,
+                    "closed": summary.closed,
+                    "description": summary.description,
+                    "message_samples": samples,
+                }
+            )
+
+        # Run analysis
+        stats = compute_topic_stats(topic_summaries)
+        duplicates = find_duplicate_forum_topics(topic_summaries)
+        gaps = find_topic_gaps(topic_summaries)
+        dead = find_dead_forum_topics(topic_summaries, inactivity_days=inactivity_days)
+
+        # Build detail-mode result
+        detail_result = {
+            "chat_id": getattr(entity, "id", chat_id),
+            "chat_title": getattr(entity, "title", str(chat_id)),
+            "summary_stats": {
+                "total_topics": stats.total_topics,
+                "total_messages": stats.total_messages,
+                "median_messages_per_topic": stats.median_messages,
+                "max_messages": stats.max_messages,
+                "min_messages": stats.min_messages,
+                "p90_messages": stats.p90_messages,
+            },
+            "duplicates": [
+                {
+                    "normalized_title": d.normalized_title,
+                    "topic_ids": d.topic_ids,
+                    "original_titles": d.original_titles,
+                }
+                for d in duplicates
+            ],
+            "gaps": [{"kind": g.kind, "topic_id": g.topic_id, "detail": g.detail} for g in gaps],
+            "dead_topics": dead,
+            "topics": topic_details,
+        }
+
+        # Write Excel file
+        import json
+
+        write_analysis_to_excel(json.dumps(detail_result), output_path)
+
+        return json.dumps(
+            {
+                "success": True,
+                "output_path": output_path,
+                "chat_id": getattr(entity, "id", chat_id),
+                "chat_title": getattr(entity, "title", str(chat_id)),
+            },
+            ensure_ascii=False,
+        )
+
+    except Exception as e:
+        return log_and_format_error(
+            "export_analyze_group_excel", e, chat_id=chat_id, output_path=output_path
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Get Ref Map",
+        readOnlyHint=True,
+        openWorldHint=True,
+    )
+)
+@with_account(readonly=True)
+async def get_ref_map(
+    job_id: str,
+    *,
+    source_chat_id: int | None = None,
+    source_msg_id: int | None = None,
+    dest_chat_id: int | None = None,
+    dest_msg_id: int | None = None,
+    list_all: bool = False,
+    stats_only: bool = False,
+    account: str | None = None,
+) -> str:
+    """
+    Query the cross-reference map (state file) for a migration/curation job.
+    Lets the agent know what was already processed during migration.
+
+    The ref map stores source_message → destination_message mappings.
+    Use this to check if content was already copied, or to find messages for rollback.
+
+    Args:
+        job_id: The job identifier (returned by curate_content_to_group or forward_topics_from_group).
+        source_chat_id: Optional filter by source chat ID.
+        source_msg_id: Optional filter by source message ID (requires source_chat_id).
+        dest_chat_id: Optional filter by destination chat ID.
+        dest_msg_id: Optional filter by destination message ID (requires dest_chat_id).
+        list_all: If True, return all entries for the job (up to 1000).
+        stats_only: If True, return only summary statistics for the job.
+        account: Optional account label (unused, for consistency).
+
+    Returns:
+        JSON with entries or stats. Each entry has:
+        - job_id, source_chat_id, source_msg_id, dest_chat_id, dest_msg_id
+        - dest_topic_id (if applicable), timestamp, meta dict.
+    """
+    try:
+        from telegram_mcp.ref_map import RefMap
+        import os
+
+        # Use same base dir as JobStore
+        cache_home = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+        base_dir = Path(cache_home) / "telegram-mcp" / "jobs"
+        ref_map = RefMap(base_dir)
+
+        if stats_only:
+            stats = ref_map.get_stats(job_id)
+            return json.dumps(stats, ensure_ascii=False)
+
+        if list_all:
+            entries = ref_map.list_for_job(job_id)
+            return json.dumps(
+                {
+                    "job_id": job_id,
+                    "count": len(entries),
+                    "entries": [e.to_dict() for e in entries[:1000]],
+                },
+                ensure_ascii=False,
+            )
+
+        if source_chat_id is not None and source_msg_id is not None:
+            entry = ref_map.get(job_id, source_chat_id, source_msg_id)
+            if entry:
+                return json.dumps(entry.to_dict(), ensure_ascii=False)
+            return json.dumps({"found": False, "job_id": job_id}, ensure_ascii=False)
+
+        if dest_chat_id is not None and dest_msg_id is not None:
+            entry = ref_map.get_by_dest(job_id, dest_chat_id, dest_msg_id)
+            if entry:
+                return json.dumps(entry.to_dict(), ensure_ascii=False)
+            return json.dumps({"found": False, "job_id": job_id}, ensure_ascii=False)
+
+        # Default: list jobs
+        jobs = ref_map.list_jobs()
+        return json.dumps({"jobs": jobs}, ensure_ascii=False)
+
+    except Exception as e:
+        return log_and_format_error("get_ref_map", e, job_id=job_id)

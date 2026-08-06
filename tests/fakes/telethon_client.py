@@ -91,3 +91,6 @@ class FakeClient:
 
     async def send_file(self, entity: Any, file: Any = None, **kwargs: Any) -> None:
         self.sent_files.append({"entity": entity, "file": file, **kwargs})
+
+    def is_connected(self) -> bool:
+        return True
