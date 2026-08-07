@@ -626,6 +626,120 @@ def _extract_created_topic_id(result) -> Optional[int]:
     return None
 
 
+@mcp.tool(annotations=ToolAnnotations(title="Find or Create Forum Topic", openWorldHint=True))
+@with_account(readonly=False)
+@validate_id("chat_id")
+async def find_or_create_topic(
+    chat_id: Union[int, str],
+    title: str,
+    *,
+    icon_emoji_id: int | None = None,
+    icon_color: int | None = None,
+    account: str = None,
+) -> str:
+    """
+    Find existing topic by EXACT title match (local filter using normalize_forum_title),
+    or create new one if not found. Returns topic_id.
+
+    Atomic: no race condition between check and create.
+    Uses the same sanitization as create_forum_topic.
+    """
+    try:
+        cl = get_client(account)
+        entity = await resolve_entity(chat_id, cl)
+
+        if not isinstance(entity, Channel) or not getattr(entity, "megagroup", False):
+            return "The specified chat is not a supergroup."
+
+        if not getattr(entity, "forum", False):
+            return (
+                "The specified supergroup does not have forum topics enabled. "
+                "Use enable_forum_topics first."
+            )
+
+        # Sanitize title using same logic as create_forum_topic
+        clean_title = _sanitize_topic_title(title)
+        if not clean_title or clean_title == "[empty]":
+            return f"Invalid topic title after sanitization: {title!r}"
+
+        # Normalize for comparison
+        from telegram_mcp.group_analysis import normalize_forum_title
+
+        normalized_target = normalize_forum_title(clean_title)
+
+        # List all topics (fetch_all) and search locally
+        all_records = []
+        current_offset = 0
+        limit = 100
+
+        while True:
+            result = await cl(
+                GetForumTopicsRequest(
+                    channel=entity,
+                    offset_date=0,
+                    offset_id=0,
+                    offset_topic=current_offset,
+                    limit=limit,
+                    q=None,
+                )
+            )
+
+            topics = getattr(result, "topics", None) or []
+            if not topics:
+                break
+
+            for topic in topics:
+                topic_title = getattr(topic, "title", None) or ""
+                normalized_topic = normalize_forum_title(topic_title)
+                if normalized_topic == normalized_target:
+                    # Exact match found
+                    return format_tool_result(
+                        [
+                            {
+                                "topic_id": topic.id,
+                                "title": topic_title,
+                                "created": False,
+                            }
+                        ]
+                    )
+
+            if len(topics) < limit:
+                break
+            current_offset = topics[-1].id
+
+        # Not found - create new topic
+        result = await cl(
+            CreateForumTopicRequest(
+                peer=entity,
+                title=clean_title,
+                random_id=secrets.randbits(63),
+                icon_color=icon_color,
+                icon_emoji_id=icon_emoji_id,
+            )
+        )
+
+        topic_id = _extract_created_topic_id(result)
+        record = {
+            "topic_id": topic_id,
+            "title": clean_title,
+            "created": True,
+        }
+        if topic_id is None:
+            record["topic_id"] = None
+            record["warning"] = "Topic created but ID not returned in updates"
+
+        return format_tool_result([record])
+    except Exception as e:
+        return log_and_format_error(
+            "find_or_create_topic",
+            e,
+            chat_id=chat_id,
+            title=title,
+            icon_color=icon_color,
+            icon_emoji_id=icon_emoji_id,
+        )
+
+
 @mcp.tool(annotations=ToolAnnotations(title="List Chats", openWorldHint=True, readOnlyHint=True))
 @with_account(readonly=True)
 async def list_chats(
@@ -1643,6 +1757,7 @@ async def delete_topic_by_title(
 __all__ = [
     "get_chats",
     "list_topics",
+    "find_or_create_topic",
     "diff_chats",
     "delete_topic_by_title",
     "enable_forum_topics",
