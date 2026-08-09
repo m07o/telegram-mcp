@@ -1,9 +1,9 @@
 import argparse
+import asyncio
 import os
 import sys
 import json
 import time
-import asyncio
 import sqlite3
 import logging
 import mimetypes
@@ -14,7 +14,6 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 # Third-party libraries
-import nest_asyncio
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.types import Annotations, TextContent, ToolAnnotations
@@ -98,7 +97,10 @@ def get_entity_filter_type(entity: Any) -> Optional[str]:
     return None
 
 
-load_dotenv()
+try:
+    load_dotenv()
+except Exception as e:
+    print(f"WARNING: Failed to load .env file: {e}", file=sys.stderr)
 
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
@@ -196,7 +198,12 @@ def _get_proxy_env(name: str, label: str) -> Optional[str]:
 def _parse_bool_env(value: Optional[str], default: bool) -> bool:
     if value is None:
         return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    v = value.strip().lower()
+    if v in {"1", "true", "yes", "on"}:
+        return True
+    if v in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def _build_proxy_for_label(label: str) -> tuple[Optional[Any], Optional[Any]]:
@@ -611,12 +618,13 @@ def validate_id(*param_names_to_validate):
                                 )
                             return int_value, None
                         except ValueError:
-                            if re.match(r"^@?[a-zA-Z0-9_]{5,}$", value):
+                            # Support usernames (@username), phone numbers (+1234567890), and bare usernames
+                            if re.match(r"^@?[a-zA-Z0-9_]{5,}$", value) or re.match(r"^\+?[0-9]{7,}$", value):
                                 return value, None
                             else:
                                 return (
                                     None,
-                                    f"Invalid {p_name}: '{value}'. Must be a valid integer ID, or a username string.",
+                                    f"Invalid {p_name}: '{value}'. Must be a valid integer ID, username, or phone number.",
                                 )
 
                     # Handle other invalid types

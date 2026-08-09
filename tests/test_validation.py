@@ -62,7 +62,7 @@ async def test_invalid_float_id():
 async def test_invalid_string_id():
     result = await dummy_function(user_id="inv")  # too short
     assert "Invalid user_id" in result
-    assert "Must be a valid integer ID, or a username string" in result
+    assert "Must be a valid integer ID, username, or phone number" in result
 
 
 @pytest.mark.asyncio

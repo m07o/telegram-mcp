@@ -1287,5 +1287,465 @@ async def copy_topic_selective(
         )
 
 
+# =============================================================================
+# COMPREHENSIVE MIGRATION TOOL - Full group analysis and sync
+# =============================================================================
+
+
+async def _fetch_topic_last_message_date(cl: TelegramClient, entity, topic_id: int):
+    """Fetch the last (most recent) message date for a topic."""
+    try:
+        msgs = await cl.get_messages(entity, reply_to=topic_id, limit=1)
+        if msgs and getattr(msgs[0], "date", None):
+            return msgs[0].date
+    except Exception:
+        pass
+    return None
+
+
+async def _analyze_source_group(cl: TelegramClient, source_entity) -> list:
+    """Analyze all topics in source group, return list sorted by last_message_date (oldest first)."""
+    from telegram_mcp.forum_pagination import iter_forum_topics
+    
+    topic_infos = []
+    async for topic in iter_forum_topics(cl, source_entity):
+        title = getattr(topic, "title", None) or "(no title)"
+        topic_id = topic.id
+        
+        # Get last message date
+        last_msg_date = await _fetch_topic_last_message_date(cl, source_entity, topic_id)
+        
+        # Get total messages
+        total_messages = getattr(topic, "total_messages", 0)
+        
+        topic_infos.append({
+            "topic_id": topic_id,
+            "title": title,
+            "last_message_date": last_msg_date,
+            "total_messages": total_messages,
+            "closed": bool(getattr(topic, "closed", False)),
+            "hidden": bool(getattr(topic, "hidden", False)),
+        })
+    
+    # Sort by last_message_date: oldest first (None dates go to end)
+    topic_infos.sort(key=lambda x: x["last_message_date"] or datetime.max.replace(tzinfo=timezone.utc))
+    
+    return topic_infos
+
+
+async def _analyze_target_group(cl: TelegramClient, target_entity) -> dict:
+    """Analyze all topics in target group, return title -> topic info map."""
+    from telegram_mcp.forum_pagination import iter_forum_topics
+    
+    target_topics = {}
+    async for topic in iter_forum_topics(cl, target_entity):
+        title = getattr(topic, "title", None) or "(no title)"
+        normalized = normalize_forum_title(title)
+        if normalized not in target_topics:
+            target_topics[normalized] = []
+        target_topics[normalized].append({
+            "topic_id": topic.id,
+            "title": title,
+            "total_messages": getattr(topic, "total_messages", 0),
+            "closed": bool(getattr(topic, "closed", False)),
+            "hidden": bool(getattr(topic, "hidden", False)),
+        })
+    
+    return target_topics
+
+
+async def _remove_duplicate_topics(cl: TelegramClient, target_entity, target_topics: dict, dry_run: bool = False) -> dict:
+    """Remove duplicate topics in target group, keeping the oldest (lowest ID)."""
+    from telethon.tl.functions.messages import DeleteTopicHistoryRequest
+    from telethon.tl import types
+    
+    removed = []
+    kept = []
+    
+    for normalized_title, topics in target_topics.items():
+        if len(topics) > 1:
+            # Sort by topic_id (oldest first)
+            topics_sorted = sorted(topics, key=lambda x: x["topic_id"])
+            keep_topic = topics_sorted[0]
+            delete_topics = topics_sorted[1:]
+            
+            kept.append(keep_topic)
+            
+            for dup in delete_topics:
+                if not dry_run:
+                    try:
+                        await cl(DeleteTopicHistoryRequest(
+                            channel=types.InputChannel(target_entity.id, target_entity.access_hash),
+                            top_msg_id=dup["topic_id"],
+                        ))
+                        removed.append({"topic_id": dup["topic_id"], "title": dup["title"]})
+                    except Exception as e:
+                        logger.warning(f"Failed to delete duplicate topic {dup['topic_id']}: {e}")
+                else:
+                    removed.append({"topic_id": dup["topic_id"], "title": dup["title"], "dry_run": True})
+        else:
+            kept.append(topics[0])
+    
+    return {"removed": removed, "kept": kept}
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Comprehensive Group Migration",
+        openWorldHint=True,
+        destructiveHint=True,
+    )
+)
+@with_account(readonly=False)
+@validate_id("source_chat_id", "target_chat_id")
+async def migrate_group_comprehensive(
+    source_chat_id: Union[int, str],
+    target_chat_id: Union[int, str],
+    *,
+    job_id: str | None = None,
+    delay: float = 2.0,
+    batch_delay: float = 5.0,
+    inter_topic_delay: float = 10.0,
+    delay_before_create: float = 2.0,
+    delay_after_create: float = 3.0,
+    verification_tolerance: int = 5,
+    max_retries: int = 3,
+    limit_per_topic: int = 0,
+    cleanup_noise_first: bool = True,
+    remove_duplicates: bool = True,
+    dry_run: bool = False,
+    account: str | None = None,
+) -> str:
+    """
+    COMPREHENSIVE GROUP MIGRATION - Analyzes entire group, removes duplicates, syncs all topics.
+
+    WORKFLOW:
+    1. Analyze source group - fetch ALL topics with last_message_date
+    2. Analyze target group - fetch ALL topics
+    3. Remove duplicate topics in target (keep oldest)
+    4. For each topic in source (ordered by last_message_date, oldest first):
+       a. Check state - SKIP if COMPLETE+verified
+       b. Find or create topic in target (atomic, no duplicates)
+       c. Compare topics - content-based diff (text + media hash)
+       d. Cleanup noise in target FIRST (===, ., /, @, bot commands)
+       e. Migrate ONLY missing messages (preserving original sequence)
+       f. Verify sync with tolerance
+       g. Record everything in persistent state + RefMap
+    5. Wait inter_topic_delay between topics
+
+    ORDERING: Topics processed by last_message_date (oldest first)
+    MESSAGE ORDER: Within each topic, messages copied oldest-to-newest
+
+    Args:
+        source_chat_id: Source supergroup ID or username.
+        target_chat_id: Destination supergroup ID or username.
+        job_id: Stable identifier for resumable progress (auto-generated if omitted).
+        delay: Delay between message copies (default 2.0s).
+        batch_delay: Delay after every 20 messages (default 5.0s).
+        inter_topic_delay: Delay after completing each topic (default 10.0s).
+        delay_before_create: Wait before creating topic (default 2.0s).
+        delay_after_create: Wait after creating topic (default 3.0s).
+        verification_tolerance: Allow extra messages in target (default 5).
+        max_retries: Max retries for failed topics (default 3).
+        limit_per_topic: Max messages per topic (0 = all).
+        cleanup_noise_first: Clean target noise before copy (default True).
+        remove_duplicates: Remove duplicate topics in target (default True).
+        dry_run: If True, only analyze and report what would be done (default False).
+        account: Optional account label.
+
+    Returns:
+        JSON summary with full analysis and migration results.
+    """
+    try:
+        cl = get_client(account if account is not None else "")
+        source_entity = await resolve_entity(source_chat_id, cl)
+        target_entity = await resolve_entity(target_chat_id, cl)
+
+        # Validate both are forum-enabled supergroups
+        for label, entity in (("source", source_entity), ("target", target_entity)):
+            if getattr(entity, "megagroup", False) is not True:
+                return f"The {label} chat is not a supergroup."
+            if getattr(entity, "forum", False) is not True:
+                return f"The {label} supergroup does not have forum topics enabled."
+
+        # Initialize state store and RefMap
+        if not job_id:
+            job_id = generate_migration_job_id()
+
+        state_store = MigrationStateStore()
+        job = state_store.load_or_create(job_id, str(source_chat_id), str(target_chat_id))
+
+        cache_home = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+        ref_map = RefMap(Path(cache_home) / "telegram-mcp" / "jobs")
+
+        # Store config
+        job.config = {
+            "delay": delay,
+            "batch_delay": batch_delay,
+            "inter_topic_delay": inter_topic_delay,
+            "delay_before_create": delay_before_create,
+            "delay_after_create": delay_after_create,
+            "verification_tolerance": verification_tolerance,
+            "max_retries": max_retries,
+            "limit_per_topic": limit_per_topic,
+            "cleanup_noise_first": cleanup_noise_first,
+            "remove_duplicates": remove_duplicates,
+        }
+        job.source_chat_id = source_entity.id
+        job.target_chat_id = target_entity.id
+
+        # ============================================================
+        # STEP 1: Analyze source group
+        # ============================================================
+        logger.info(f"[{job_id}] Analyzing source group...")
+        source_topics = await _analyze_source_group(cl, source_entity)
+        logger.info(f"[{job_id}] Found {len(source_topics)} topics in source")
+
+        # ============================================================
+        # STEP 2: Analyze target group
+        # ============================================================
+        logger.info(f"[{job_id}] Analyzing target group...")
+        target_topics = await _analyze_target_group(cl, target_entity)
+        logger.info(f"[{job_id}] Found {len(target_topics)} unique topic titles in target")
+
+        # ============================================================
+        # STEP 3: Remove duplicates in target
+        # ============================================================
+        duplicate_report = {"removed": [], "kept": []}
+        if remove_duplicates:
+            logger.info(f"[{job_id}] Checking for duplicate topics in target...")
+            duplicate_report = await _remove_duplicate_topics(cl, target_entity, target_topics, dry_run=dry_run)
+            logger.info(f"[{job_id}] Duplicates: {len(duplicate_report['removed'])} removed, {len(duplicate_report['kept'])} kept")
+            
+            # Rebuild target_topics map after removal
+            if not dry_run and duplicate_report["removed"]:
+                target_topics = await _analyze_target_group(cl, target_entity)
+
+        # ============================================================
+        # STEP 4: Build migration plan
+        # ============================================================
+        migration_plan = []
+        for topic_info in source_topics:
+            topic_id = topic_info["topic_id"]
+            title = topic_info["title"]
+            normalized = normalize_forum_title(title)
+            
+            # Check if already complete
+            existing = job.get_topic(topic_id)
+            if existing and existing.status == "complete" and existing.verification.get("synced", False):
+                migration_plan.append({
+                    "topic_id": topic_id,
+                    "title": title,
+                    "action": "skip",
+                    "reason": "already complete and verified",
+                    "last_message_date": topic_info["last_message_date"].isoformat() if topic_info["last_message_date"] else None,
+                })
+                continue
+            
+            # Check if topic exists in target
+            target_topic_id = None
+            if normalized in target_topics and target_topics[normalized]:
+                target_topic_id = target_topics[normalized][0]["topic_id"]
+            
+            migration_plan.append({
+                "topic_id": topic_id,
+                "title": title,
+                "target_topic_id": target_topic_id,
+                "action": "migrate",
+                "reason": "create and copy" if target_topic_id is None else "copy to existing",
+                "last_message_date": topic_info["last_message_date"].isoformat() if topic_info["last_message_date"] else None,
+                "total_messages": topic_info["total_messages"],
+            })
+
+        if dry_run:
+            return format_tool_result([{
+                "job_id": job_id,
+                "dry_run": True,
+                "source_topic_count": len(source_topics),
+                "target_unique_titles": len(target_topics),
+                "duplicates_removed": len(duplicate_report["removed"]),
+                "migration_plan": migration_plan,
+            }])
+
+        # ============================================================
+        # STEP 5: Execute migration for each topic
+        # ============================================================
+        total = len([p for p in migration_plan if p["action"] == "migrate"])
+        copied = 0
+        partial = 0
+        skipped = 0
+        failed = 0
+
+        for idx, plan in enumerate(migration_plan):
+            if plan["action"] == "skip":
+                skipped += 1
+                job.completed_topics += 1
+                state_store.save(job)
+                continue
+
+            topic_id = plan["topic_id"]
+            title = plan["title"]
+            target_topic_id = plan["target_topic_id"]
+
+            logger.info(f"[{job_id}] Processing topic {idx+1}/{len(migration_plan)}: {title} (ID: {topic_id})")
+
+            # Mark as in_progress
+            job.in_progress_topic_id = topic_id
+            record = TopicMigrationRecord(
+                source_topic_id=topic_id,
+                source_topic_title=title,
+                status="in_progress",
+                started_at=datetime.now(timezone.utc).isoformat(),
+            )
+            job.set_topic(record)
+            state_store.save(job)
+
+            topic_failed = False
+            final_target_topic_id = None
+
+            for attempt in range(max_retries):
+                try:
+                    # Step 1: Find or create topic in target
+                    logger.info(f"[{job_id}] Step 1: find_or_create_topic for '{title}'")
+                    final_target_topic_id, created, err = await _find_or_create_topic_impl(
+                        cl, target_entity, title,
+                        delay_before=delay_before_create,
+                        delay_after=delay_after_create,
+                    )
+                    if err:
+                        raise Exception(f"Topic creation failed: {err}")
+
+                    record.target_topic_id = final_target_topic_id
+                    record.target_topic_title = title
+                    job.set_topic(record)
+                    state_store.save(job)
+
+                    # Update target_topics map
+                    normalized = normalize_forum_title(title)
+                    if normalized not in target_topics:
+                        target_topics[normalized] = []
+                    target_topics[normalized].insert(0, {"topic_id": final_target_topic_id, "title": title})
+
+                    # Step 2: Compare topics
+                    logger.info(f"[{job_id}] Step 2: compare_topics")
+                    diff = await _compare_topics_impl(
+                        cl, source_entity, topic_id, target_entity, final_target_topic_id
+                    )
+
+                    record.source_message_count = diff["source_total"]
+                    record.target_message_count = diff["target_total"]
+                    job.set_topic(record)
+                    state_store.save(job)
+
+                    # Step 3: Cleanup noise in target
+                    if cleanup_noise_first and diff["extra_count"] > 0:
+                        logger.info(f"[{job_id}] Step 3: cleanup_topic_noise ({diff['extra_count']} extra messages)")
+                        cleanup_result = await _cleanup_topic_noise_impl(cl, target_entity, final_target_topic_id, dry_run=False)
+                        logger.info(f"[{job_id}] Cleaned up {cleanup_result['deleted']} noise messages")
+
+                    # Step 4: Migrate missing messages
+                    resume_from = record.last_copied_source_msg_id
+                    logger.info(f"[{job_id}] Step 4: migrate_incremental (resume_from={resume_from}, missing={diff['missing_count']})")
+
+                    migrate_result = await _migrate_incremental_impl(
+                        cl, source_entity, topic_id, target_entity, final_target_topic_id,
+                        resume_from_msg_id=resume_from,
+                        limit=limit_per_topic,
+                        delay=delay,
+                        batch_delay=batch_delay,
+                        inter_topic_delay=0,
+                        ref_map=ref_map,
+                        job_id=job_id,
+                    )
+
+                    record.copied_message_count += migrate_result["copied"]
+                    record.failed_message_count += migrate_result["failed"]
+                    record.skipped_message_count += migrate_result["skipped"]
+                    record.last_copied_source_msg_id = migrate_result["last_copied_source_id"]
+                    record.last_copied_target_msg_id = migrate_result["last_copied_target_id"]
+                    job.set_topic(record)
+                    state_store.save(job)
+
+                    # Step 5: Verify sync
+                    logger.info(f"[{job_id}] Step 5: verify_topic_sync")
+                    verify_result = await _verify_topic_sync_impl(
+                        cl, source_entity, topic_id, target_entity, final_target_topic_id,
+                        tolerance=verification_tolerance,
+                    )
+
+                    record.verification = verify_result
+                    record.target_message_count = verify_result["target_count"]
+                    job.set_topic(record)
+                    state_store.save(job)
+
+                    if verify_result["synced"]:
+                        record.status = "complete"
+                        record.completed_at = datetime.now(timezone.utc).isoformat()
+                        copied += 1
+                        job.completed_topics += 1
+                        logger.info(f"[{job_id}] Topic '{title}' COMPLETE (copied {migrate_result['copied']} messages)")
+                    else:
+                        record.status = "partial"
+                        partial += 1
+                        job.partial_topics += 1
+                        logger.warning(f"[{job_id}] Topic '{title}' PARTIAL: missing={verify_result['missing_count']}, extra={verify_result['extra_count']}")
+
+                    break  # Success, exit retry loop
+
+                except Exception as e:
+                    logger.error(f"[{job_id}] Attempt {attempt+1}/{max_retries} failed for '{title}': {e}")
+                    if attempt == max_retries - 1:
+                        record.status = "failed"
+                        record.error = str(e)[:500]
+                        failed += 1
+                        job.failed_topics += 1
+                        topic_failed = True
+                    else:
+                        await asyncio.sleep(5 * (attempt + 1))
+
+            # Clear in_progress
+            job.in_progress_topic_id = None
+            job.set_topic(record)
+            state_store.save(job)
+
+            # Inter-topic delay
+            if idx < len(migration_plan) - 1 and inter_topic_delay > 0:
+                logger.info(f"[{job_id}] Waiting {inter_topic_delay}s before next topic...")
+                await asyncio.sleep(inter_topic_delay)
+
+        # Final summary
+        job.in_progress_topic_id = None
+        state_store.save(job)
+
+        summary = {
+            "job_id": job_id,
+            "source_chat_id": source_entity.id,
+            "target_chat_id": target_entity.id,
+            "source_topic_count": len(source_topics),
+            "target_unique_titles": len(target_topics),
+            "duplicates_removed": len(duplicate_report["removed"]),
+            "total_topics_to_migrate": total,
+            "completed": copied,
+            "partial": partial,
+            "skipped": skipped,
+            "failed": failed,
+            "config": job.config,
+            "state_file": str(state_store._path(job_id)),
+            "ref_map_dir": str(ref_map.base_dir / f"{job_id.replace('/', '_').replace('\\', '_')}.json"),
+        }
+
+        return format_tool_result([summary])
+
+    except Exception as e:
+        logger.error(f"migrate_group_comprehensive unexpected error: {type(e).__name__}: {e}")
+        return log_and_format_error(
+            "migrate_group_comprehensive",
+            e,
+            source_chat_id=source_chat_id,
+            target_chat_id=target_chat_id,
+            job_id=job_id,
+        )
+
+
 # Need to import os for the new module
 import os

@@ -53,8 +53,20 @@ async def _handle_flood_wait(func, *args, max_retries: int = 3, **kwargs):
                 f"Telegram error in {func.__name__ if hasattr(func, '__name__') else 'call'}: {type(e).__name__}: {e}"
             )
             raise
-    # Last attempt without catch
-    return await func(*args, **kwargs)
+    # Final attempt with error handling
+    try:
+        return await func(*args, **kwargs)
+    except FloodWaitError as e:
+        wait_time = e.seconds + 5
+        if wait_time > 1800:
+            logger.error(f"FloodWait too long on final attempt: {wait_time}s")
+            raise
+        logger.warning(f"FloodWait on final attempt: waiting {wait_time}s")
+        await asyncio.sleep(wait_time)
+        return await func(*args, **kwargs)
+    except Exception as e:
+        logger.error(f"Final attempt failed: {type(e).__name__}: {e}")
+        raise
 
 
 # Characters to PRESERVE in topic titles (needed for proper Arabic/RTL display)
