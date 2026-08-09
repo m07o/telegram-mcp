@@ -1,8 +1,12 @@
 """Chats MCP tools."""
 
+import asyncio
+import logging
 import secrets
 import struct
+import time
 
+from telethon.errors import FloodWaitError
 from telethon.tl.tlobject import TLObject, TLRequest
 
 from telegram_mcp.runtime import *
@@ -10,6 +14,48 @@ from telegram_mcp.runtime import *
 
 import re
 import unicodedata
+
+# Module logger
+logger = logging.getLogger(__name__)
+
+# Rate limiter for topic creation (tracks recent creation timestamps)
+_topic_creation_times: list[float] = []
+
+
+async def _rate_limit_topic_creation(min_interval: float = 5.0) -> None:
+    """Enforce minimum interval between topic creations."""
+    global _topic_creation_times
+    now = time.time()
+    # Clean old entries (older than 1 hour)
+    _topic_creation_times = [t for t in _topic_creation_times if now - t < 3600]
+    if _topic_creation_times:
+        elapsed = now - _topic_creation_times[-1]
+        if elapsed < min_interval:
+            await asyncio.sleep(min_interval - elapsed)
+    _topic_creation_times.append(time.time())
+
+
+async def _handle_flood_wait(func, *args, max_retries: int = 3, **kwargs):
+    """Execute func with FloodWait handling and exponential backoff."""
+    for attempt in range(max_retries):
+        try:
+            return await func(*args, **kwargs)
+        except FloodWaitError as e:
+            wait_time = e.seconds + 5  # Add small buffer
+            if wait_time > 1800:  # > 30 min, don't wait that long
+                logger.error(f"FloodWait too long: {wait_time}s, giving up")
+                raise
+            logger.warning(f"FloodWait: waiting {wait_time}s (attempt {attempt+1}/{max_retries})")
+            await asyncio.sleep(wait_time)
+        except Exception as e:
+            # Log actual Telegram error for debugging
+            logger.error(
+                f"Telegram error in {func.__name__ if hasattr(func, '__name__') else 'call'}: {type(e).__name__}: {e}"
+            )
+            raise
+    # Last attempt without catch
+    return await func(*args, **kwargs)
+
 
 # Characters to PRESERVE in topic titles (needed for proper Arabic/RTL display)
 _TOPIC_TITLE_PRESERVE = {
@@ -350,27 +396,66 @@ async def list_topics(
 
         # Prepare normalized search query for client-side title filtering
         from telegram_mcp.group_analysis import normalize_forum_title
+        from telegram_mcp.forum_pagination import iter_forum_topics
 
         normalized_search = normalize_forum_title(search_query) if search_query else None
 
         all_records = []
-        current_offset = offset_topic
 
-        while True:
+        if fetch_all:
+            # Use the shared pagination helper to get ALL topics
+            async for topic in iter_forum_topics(cl, entity, page_size=limit):
+                title = getattr(topic, "title", None) or "(no title)"
+
+                if normalized_search:
+                    normalized_title = normalize_forum_title(title)
+                    if normalized_search not in normalized_title:
+                        continue
+
+                record = {
+                    "id": topic.id,
+                    "title": sanitize_user_content(title, max_length=256),
+                }
+
+                total_messages = getattr(topic, "total_messages", None)
+                if total_messages is not None:
+                    record["total_messages"] = total_messages
+
+                unread_count = getattr(topic, "unread_count", None)
+                if unread_count:
+                    record["unread"] = unread_count
+
+                record["closed"] = bool(getattr(topic, "closed", False))
+                record["hidden"] = bool(getattr(topic, "hidden", False))
+
+                # Note: top_message/last_activity not available without extra API calls
+                # when using iter_forum_topics. For full details, use fetch_all=False with offset_topic.
+
+                all_records.append(record)
+
+                # Respect limit even in fetch_all mode for safety
+                if len(all_records) >= limit:
+                    break
+        else:
+            # Manual pagination mode - single page
+            current_offset = offset_topic
+            offset_date = 0
+            offset_id = 0
+
             result = await cl(
                 GetForumTopicsRequest(
                     channel=entity,
-                    offset_date=0,
-                    offset_id=0,
+                    offset_date=offset_date,
+                    offset_id=offset_id,
                     offset_topic=current_offset,
                     limit=limit,
-                    q=None,  # Telegram's q searches message content, not titles
+                    q=None,
                 )
             )
 
             topics = getattr(result, "topics", None) or []
             if not topics:
-                break
+                return "No topics found for this chat."
 
             messages_map = {}
             if getattr(result, "messages", None):
@@ -379,11 +464,10 @@ async def list_topics(
             for topic in topics:
                 title = getattr(topic, "title", None) or "(no title)"
 
-                # Client-side title filtering (Telegram's q searches message content, not titles)
                 if normalized_search:
                     normalized_title = normalize_forum_title(title)
                     if normalized_search not in normalized_title:
-                        continue  # Skip topics that don't match
+                        continue
 
                 record = {
                     "id": topic.id,
@@ -407,13 +491,6 @@ async def list_topics(
                     record["last_activity"] = top_message.date.isoformat()
 
                 all_records.append(record)
-
-            # If not fetching all, or we got fewer than limit, we're done
-            if not fetch_all or len(topics) < limit:
-                break
-
-            # Use the LAST topic's ID as the offset for the next batch
-            current_offset = topics[-1].id
 
         if not all_records:
             return "No topics found for this chat."
@@ -545,6 +622,8 @@ async def create_forum_topic(
     title: str,
     icon_color: int = None,
     icon_emoji_id: int = None,
+    delay_before: float = 2.0,
+    delay_after: float = 3.0,
     account: str = None,
 ) -> str:
     """
@@ -555,6 +634,8 @@ async def create_forum_topic(
         title: Topic title.
         icon_color: Optional Telegram topic icon color integer.
         icon_emoji_id: Optional custom emoji document ID for the topic icon.
+        delay_before: Seconds to wait before creating topic (default 2.0).
+        delay_after: Seconds to wait after creating topic (default 3.0).
 
     Returns a JSON result with chat_id, topic_id (when Telegram returns it), and title.
     """
@@ -575,15 +656,48 @@ async def create_forum_topic(
         clean_title = _sanitize_topic_title(title)
         if not clean_title or clean_title == "[empty]":
             return f"Invalid topic title after sanitization: {title!r}"
-        result = await cl(
-            CreateForumTopicRequest(
-                peer=entity,
-                title=clean_title,
-                random_id=secrets.randbits(63),
+
+        # Rate limit: enforce minimum interval between topic creations
+        await _rate_limit_topic_creation(min_interval=5.0)
+
+        # Delay before create
+        if delay_before > 0:
+            await asyncio.sleep(delay_before)
+
+        # Create topic with FloodWait handling
+        async def _create():
+            return await cl(
+                CreateForumTopicRequest(
+                    peer=entity,
+                    title=clean_title,
+                    random_id=secrets.randbits(63),
+                    icon_color=icon_color,
+                    icon_emoji_id=icon_emoji_id,
+                )
+            )
+
+        try:
+            result = await _handle_flood_wait(_create)
+        except FloodWaitError as e:
+            logger.error(f"create_forum_topic FloodWait after retries: {e.seconds}s")
+            return log_and_format_error(
+                "create_forum_topic",
+                e,
+                chat_id=chat_id,
+                title=title,
                 icon_color=icon_color,
                 icon_emoji_id=icon_emoji_id,
             )
-        )
+        except Exception as e:
+            logger.error(f"create_forum_topic raw error: {type(e).__name__}: {e}")
+            return log_and_format_error(
+                "create_forum_topic",
+                e,
+                chat_id=chat_id,
+                title=title,
+                icon_color=icon_color,
+                icon_emoji_id=icon_emoji_id,
+            )
 
         topic_id = _extract_created_topic_id(result)
         record = {
@@ -593,8 +707,13 @@ async def create_forum_topic(
         if topic_id is not None:
             record["topic_id"] = topic_id
 
+        # Delay after create
+        if delay_after > 0:
+            await asyncio.sleep(delay_after)
+
         return format_tool_result([record])
     except Exception as e:
+        logger.error(f"create_forum_topic unexpected error: {type(e).__name__}: {e}")
         return log_and_format_error(
             "create_forum_topic",
             e,
@@ -635,6 +754,8 @@ async def find_or_create_topic(
     *,
     icon_emoji_id: int | None = None,
     icon_color: int | None = None,
+    delay_before: float = 2.0,
+    delay_after: float = 3.0,
     account: str = None,
 ) -> str:
     """
@@ -708,15 +829,46 @@ async def find_or_create_topic(
             current_offset = topics[-1].id
 
         # Not found - create new topic
-        result = await cl(
-            CreateForumTopicRequest(
-                peer=entity,
-                title=clean_title,
-                random_id=secrets.randbits(63),
+        # Rate limit: enforce minimum interval between topic creations
+        await _rate_limit_topic_creation(min_interval=5.0)
+
+        # Delay before create
+        if delay_before > 0:
+            await asyncio.sleep(delay_before)
+
+        async def _create():
+            return await cl(
+                CreateForumTopicRequest(
+                    peer=entity,
+                    title=clean_title,
+                    random_id=secrets.randbits(63),
+                    icon_color=icon_color,
+                    icon_emoji_id=icon_emoji_id,
+                )
+            )
+
+        try:
+            result = await _handle_flood_wait(_create)
+        except FloodWaitError as e:
+            logger.error(f"find_or_create_topic FloodWait after retries: {e.seconds}s")
+            return log_and_format_error(
+                "find_or_create_topic",
+                e,
+                chat_id=chat_id,
+                title=title,
                 icon_color=icon_color,
                 icon_emoji_id=icon_emoji_id,
             )
-        )
+        except Exception as e:
+            logger.error(f"find_or_create_topic raw error: {type(e).__name__}: {e}")
+            return log_and_format_error(
+                "find_or_create_topic",
+                e,
+                chat_id=chat_id,
+                title=title,
+                icon_color=icon_color,
+                icon_emoji_id=icon_emoji_id,
+            )
 
         topic_id = _extract_created_topic_id(result)
         record = {
@@ -728,8 +880,13 @@ async def find_or_create_topic(
             record["topic_id"] = None
             record["warning"] = "Topic created but ID not returned in updates"
 
+        # Delay after create
+        if delay_after > 0:
+            await asyncio.sleep(delay_after)
+
         return format_tool_result([record])
     except Exception as e:
+        logger.error(f"find_or_create_topic unexpected error: {type(e).__name__}: {e}")
         return log_and_format_error(
             "find_or_create_topic",
             e,
@@ -1396,7 +1553,10 @@ async def copy_topic(
     to_chat_id: Union[int, str],
     topic_title: Optional[str] = None,
     limit: int = 0,
-    delay: float = 0.5,
+    delay: float = 2.0,
+    batch_delay: float = 5.0,
+    inter_topic_delay: float = 10.0,
+    resume_from_msg_id: int = 0,
     account: str = None,
 ) -> str:
     """
@@ -1410,7 +1570,10 @@ async def copy_topic(
         to_chat_id: Destination supergroup ID or username.
         topic_title: Title for the new topic. If omitted, uses the source topic ID as title.
         limit: Max messages to copy (0 = all messages).
-        delay: Delay between copies in seconds (default 0.5).
+        delay: Delay between message copies in seconds (default 2.0).
+        batch_delay: Delay after every 20 messages in seconds (default 5.0).
+        inter_topic_delay: Delay after completing a topic copy in seconds (default 10.0).
+        resume_from_msg_id: Resume from this source message ID (0 = from beginning).
         account: Optional account label for multi-account mode.
     """
     try:
@@ -1462,13 +1625,41 @@ async def copy_topic(
             # Use the FIRST (oldest) topic ID when duplicates exist
             target_topic_id = existing_topics[clean_title][0]
         else:
-            create_result = await cl(
-                CreateForumTopicRequest(
-                    peer=to_entity,
-                    title=clean_title,
-                    random_id=secrets.randbits(63),
+            # Rate limit: enforce minimum interval between topic creations
+            await _rate_limit_topic_creation(min_interval=5.0)
+
+            async def _create_topic():
+                return await cl(
+                    CreateForumTopicRequest(
+                        peer=to_entity,
+                        title=clean_title,
+                        random_id=secrets.randbits(63),
+                    )
                 )
-            )
+
+            try:
+                create_result = await _handle_flood_wait(_create_topic)
+            except FloodWaitError as e:
+                logger.error(f"copy_topic create FloodWait after retries: {e.seconds}s")
+                return log_and_format_error(
+                    "copy_topic",
+                    e,
+                    from_chat_id=from_chat_id,
+                    topic_id=topic_id,
+                    to_chat_id=to_chat_id,
+                    topic_title=topic_title,
+                )
+            except Exception as e:
+                logger.error(f"copy_topic create raw error: {type(e).__name__}: {e}")
+                return log_and_format_error(
+                    "copy_topic",
+                    e,
+                    from_chat_id=from_chat_id,
+                    topic_id=topic_id,
+                    to_chat_id=to_chat_id,
+                    topic_title=topic_title,
+                )
+
             target_topic_id = _extract_created_topic_id(create_result)
             if not target_topic_id:
                 return f"Failed to create topic '{clean_title}' in target."
@@ -1484,16 +1675,36 @@ async def copy_topic(
             msgs.append(msg)
         msgs.reverse()  # Oldest first
 
-        # Copy messages
-        # Skip patterns that are typically separators/placeholders, not real content.
-        # Only skip if exact match, no media, and no formatting entities (likely system msgs).
+        # Copy messages with FloodWait handling
         SKIP_PATTERNS = {".", "===", "/", "@"}
         copied = 0
         failed = 0
         skipped = 0
+        copied_ids = []
 
-        for msg in msgs:
+        async def _send_message_with_retry(send_func, *args, **kwargs):
+            """Send message with FloodWait retry."""
+            for attempt in range(3):
+                try:
+                    return await send_func(*args, **kwargs)
+                except FloodWaitError as e:
+                    wait_time = e.seconds + 5
+                    if wait_time > 1800:
+                        raise
+                    logger.warning(
+                        f"copy_topic send FloodWait: waiting {wait_time}s (attempt {attempt+1}/3)"
+                    )
+                    await _asyncio.sleep(wait_time)
+                except Exception as e:
+                    logger.error(f"copy_topic send error: {type(e).__name__}: {e}")
+                    raise
+            return await send_func(*args, **kwargs)
+
+        for i, msg in enumerate(msgs):
             try:
+                # Resume from specific message ID
+                if resume_from_msg_id and msg.id <= resume_from_msg_id:
+                    continue
                 raw_text = getattr(msg, "message", None) or ""
                 stripped = raw_text.strip()
                 has_media = getattr(msg, "media", None) is not None
@@ -1518,27 +1729,40 @@ async def copy_topic(
                             send_kwargs["formatting_entities"] = entities
                     if hasattr(msg, "video") and msg.video:
                         send_kwargs["supports_streaming"] = True
-                    await cl.send_file(to_entity, **send_kwargs)
+                    await _send_message_with_retry(cl.send_file, to_entity, **send_kwargs)
                 elif raw_text:
                     entities = getattr(msg, "entities", None)
                     if entities:
                         send_kwargs["formatting_entities"] = entities
-                    await cl.send_message(to_entity, raw_text, **send_kwargs)
+                    await _send_message_with_retry(
+                        cl.send_message, to_entity, raw_text, **send_kwargs
+                    )
                 else:
                     skipped += 1
                     continue
 
                 copied += 1
+                copied_ids.append(msg.id)
                 await _asyncio.sleep(delay)
-            except Exception:
+
+                # Batch delay every 20 messages
+                if copied % 20 == 0 and batch_delay > 0:
+                    await _asyncio.sleep(batch_delay)
+            except Exception as e:
                 failed += 1
-                await _asyncio.sleep(1)
+                logger.error(f"copy_topic message {msg.id} failed: {type(e).__name__}: {e}")
+                await _asyncio.sleep(2)
+
+        # Inter-topic delay after completing
+        if inter_topic_delay > 0:
+            await _asyncio.sleep(inter_topic_delay)
 
         return (
             f"Topic '{clean_title}' copied: {copied} messages, "
             f"{failed} failed, {skipped} skipped (no forward tag)."
         )
     except Exception as e:
+        logger.error(f"copy_topic unexpected error: {type(e).__name__}: {e}")
         return log_and_format_error(
             "copy_topic",
             e,
@@ -1754,6 +1978,563 @@ async def delete_topic_by_title(
         return log_and_format_error("delete_topic_by_title", e, chat_id=chat_id, title=title)
 
 
+# =============================================================================
+# Deduplication-Aware Migration Tools
+# =============================================================================
+
+# Noise patterns to identify and filter out
+_NOISE_PATTERNS = {
+    ".",
+    "===",
+    "---",
+    ">>>",
+    "<<<",
+    "~~~",
+    "***",
+    "___",
+    "/",
+    "@",
+    "...",
+    "....",
+    ".....",
+    "......",
+    ".......",
+    "........",
+    ".........",
+    "..........",
+}
+
+_BOT_COMMAND_PATTERN = re.compile(r"/\w+(@\w+)?$")
+
+
+def _is_noise_message(msg) -> bool:
+    """Check if a message is noise (separator, bot command, etc.)."""
+    raw_text = getattr(msg, "message", None) or ""
+    stripped = raw_text.strip()
+
+    # Check for exact noise patterns
+    if stripped in _NOISE_PATTERNS:
+        return True
+
+    # Check for bot commands
+    if _BOT_COMMAND_PATTERN.fullmatch(stripped):
+        return True
+
+    # Check for very short messages with no media/entities (likely separators)
+    has_media = getattr(msg, "media", None) is not None
+    has_entities = bool(getattr(msg, "entities", None))
+    if not has_media and not has_entities and len(stripped) <= 3:
+        return True
+
+    # Check for forward from bot (often spam)
+    fwd_from = getattr(msg, "fwd_from", None)
+    if fwd_from and getattr(fwd_from, "from_id", None):
+        # Could add bot detection here if needed
+        pass
+
+    return False
+
+
+async def _fetch_all_topic_messages(cl, entity, topic_id: int, limit: int = 0) -> list:
+    """Fetch all messages from a topic, oldest first."""
+    msgs = []
+    iter_kwargs = {"reply_to": topic_id}
+    if limit and limit > 0:
+        iter_kwargs["limit"] = limit
+    async for msg in cl.iter_messages(entity, **iter_kwargs):
+        if getattr(msg, "action", None):
+            continue  # Skip service messages
+        msgs.append(msg)
+    msgs.reverse()  # Oldest first
+    return msgs
+
+
+async def _build_message_index(messages: list) -> dict:
+    """Build an index of messages by (text_hash, media_type) for comparison."""
+    index = {}
+    for msg in messages:
+        raw_text = getattr(msg, "message", None) or ""
+        stripped = raw_text.strip()
+        has_media = getattr(msg, "media", None) is not None
+        media_type = None
+        if has_media:
+            if getattr(msg, "photo", None):
+                media_type = "photo"
+            elif getattr(msg, "video", None):
+                media_type = "video"
+            elif getattr(msg, "document", None):
+                media_type = "document"
+            elif getattr(msg, "audio", None):
+                media_type = "audio"
+            elif getattr(msg, "voice", None):
+                media_type = "voice"
+            else:
+                media_type = "media"
+
+        # Create a content hash for comparison
+        content_key = f"{stripped[:200]}|{media_type or 'text'}"
+        index[content_key] = {
+            "id": msg.id,
+            "date": msg.date.isoformat() if getattr(msg, "date", None) else None,
+            "text": stripped[:500],
+            "media_type": media_type,
+            "has_media": has_media,
+        }
+    return index
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Compare Topics", openWorldHint=True, readOnlyHint=True)
+)
+@with_account(readonly=True)
+@validate_id("source_chat_id", "target_chat_id")
+async def compare_topics(
+    source_chat_id: Union[int, str],
+    source_topic_id: int,
+    target_chat_id: Union[int, str],
+    target_topic_id: int,
+    account: str = None,
+) -> str:
+    """
+    Compare messages between source and target topics to find missing messages.
+
+    Returns a diff report with:
+    - missing_in_target: messages that exist in source but not target
+    - extra_in_target: messages that exist in target but not source (duplicates/noise)
+    - matched_count: number of matched messages
+    - source_total: total messages in source
+    - target_total: total messages in target
+
+    Comparison is based on content (text + media type), not message IDs.
+    Noise messages (===, ., bot commands) are excluded from comparison.
+    """
+    try:
+        cl = get_client(account)
+        source_entity = await resolve_entity(source_chat_id, cl)
+        target_entity = await resolve_entity(target_chat_id, cl)
+
+        # Fetch messages from both topics
+        source_msgs = await _fetch_all_topic_messages(cl, source_entity, source_topic_id)
+        target_msgs = await _fetch_all_topic_messages(cl, target_entity, target_topic_id)
+
+        # Filter noise from both sides
+        source_filtered = [m for m in source_msgs if not _is_noise_message(m)]
+        target_filtered = [m for m in target_msgs if not _is_noise_message(m)]
+
+        # Build indexes
+        source_index = await _build_message_index(source_filtered)
+        target_index = await _build_message_index(target_filtered)
+
+        # Find missing in target
+        missing_in_target = []
+        for key, info in source_index.items():
+            if key not in target_index:
+                missing_in_target.append(info)
+
+        # Find extra in target (potential duplicates/noise)
+        extra_in_target = []
+        for key, info in target_index.items():
+            if key not in source_index:
+                extra_in_target.append(info)
+
+        # Sort by date (oldest first)
+        missing_in_target.sort(key=lambda x: x["date"] or "")
+        extra_in_target.sort(key=lambda x: x["date"] or "")
+
+        result = {
+            "source_chat_id": source_chat_id,
+            "source_topic_id": source_topic_id,
+            "target_chat_id": target_chat_id,
+            "target_topic_id": target_topic_id,
+            "source_total": len(source_msgs),
+            "target_total": len(target_msgs),
+            "source_filtered": len(source_filtered),
+            "target_filtered": len(target_filtered),
+            "matched_count": len(source_index) - len(missing_in_target),
+            "missing_in_target": missing_in_target[:100],  # Limit output
+            "extra_in_target": extra_in_target[:100],
+            "missing_count": len(missing_in_target),
+            "extra_count": len(extra_in_target),
+        }
+
+        return format_tool_result([result])
+    except Exception as e:
+        logger.error(f"compare_topics error: {type(e).__name__}: {e}")
+        return log_and_format_error(
+            "compare_topics",
+            e,
+            source_chat_id=source_chat_id,
+            source_topic_id=source_topic_id,
+            target_chat_id=target_chat_id,
+            target_topic_id=target_topic_id,
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Cleanup Topic Noise", openWorldHint=True, destructiveHint=True
+    )
+)
+@with_account(readonly=False)
+@validate_id("chat_id")
+async def cleanup_topic_noise(
+    chat_id: Union[int, str],
+    topic_id: int,
+    dry_run: bool = False,
+    account: str = None,
+) -> str:
+    """
+    Delete noise messages from a topic (===, ., bot commands, separators).
+
+    Args:
+        chat_id: The forum-enabled supergroup ID.
+        topic_id: The topic ID to clean up.
+        dry_run: If True, only report what would be deleted without deleting.
+        account: Optional account label.
+
+    Returns count of deleted messages and their IDs.
+    """
+    try:
+        cl = get_client(account)
+        entity = await resolve_entity(chat_id, cl)
+
+        msgs = await _fetch_all_topic_messages(cl, entity, topic_id)
+
+        noise_msgs = [m for m in msgs if _is_noise_message(m)]
+
+        if dry_run:
+            return format_tool_result(
+                [
+                    {
+                        "chat_id": chat_id,
+                        "topic_id": topic_id,
+                        "dry_run": True,
+                        "noise_count": len(noise_msgs),
+                        "noise_ids": [m.id for m in noise_msgs[:50]],
+                    }
+                ]
+            )
+
+        deleted = 0
+        failed = 0
+        deleted_ids = []
+
+        for msg in noise_msgs:
+            try:
+                await cl.delete_messages(entity, [msg.id])
+                deleted += 1
+                deleted_ids.append(msg.id)
+                await asyncio.sleep(0.3)  # Small delay between deletions
+            except FloodWaitError as e:
+                wait_time = e.seconds + 5
+                if wait_time > 1800:
+                    failed += 1
+                    logger.error(
+                        f"cleanup_topic_noise FloodWait too long: {wait_time}s, skipping message {msg.id}"
+                    )
+                else:
+                    logger.warning(
+                        f"cleanup_topic_noise FloodWait: waiting {wait_time}s for message {msg.id}"
+                    )
+                    await asyncio.sleep(wait_time)
+                    # Retry the deletion
+                    try:
+                        await cl.delete_messages(entity, [msg.id])
+                        deleted += 1
+                        deleted_ids.append(msg.id)
+                    except Exception as e2:
+                        failed += 1
+                        logger.warning(
+                            f"Failed to delete noise message {msg.id} after FloodWait: {e2}"
+                        )
+            except Exception as e:
+                failed += 1
+                logger.warning(f"Failed to delete noise message {msg.id}: {e}")
+
+        return format_tool_result(
+            [
+                {
+                    "chat_id": chat_id,
+                    "topic_id": topic_id,
+                    "deleted": deleted,
+                    "failed": failed,
+                    "deleted_ids": deleted_ids,
+                }
+            ]
+        )
+    except Exception as e:
+        logger.error(f"cleanup_topic_noise error: {type(e).__name__}: {e}")
+        return log_and_format_error(
+            "cleanup_topic_noise",
+            e,
+            chat_id=chat_id,
+            topic_id=topic_id,
+            dry_run=dry_run,
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Migrate Incremental", openWorldHint=True, destructiveHint=True
+    )
+)
+@with_account(readonly=False)
+@validate_id("source_chat_id", "target_chat_id")
+async def migrate_incremental(
+    source_chat_id: Union[int, str],
+    source_topic_id: int,
+    target_chat_id: Union[int, str],
+    target_topic_id: int,
+    resume_from_msg_id: int = 0,
+    limit: int = 0,
+    delay: float = 2.0,
+    batch_delay: float = 5.0,
+    inter_topic_delay: float = 10.0,
+    account: str = None,
+) -> str:
+    """
+    Migrate only missing messages from source topic to target topic.
+
+    Uses content-based comparison to find missing messages, then copies them
+    without forward tag. Resumes from a specific message ID.
+
+    Args:
+        source_chat_id: Source supergroup ID.
+        source_topic_id: Source topic ID.
+        target_chat_id: Target supergroup ID.
+        target_topic_id: Target topic ID (must exist).
+        resume_from_msg_id: Resume from this source message ID (0 = from beginning).
+        limit: Max messages to migrate (0 = all missing).
+        delay: Delay between message copies (default 2.0s).
+        batch_delay: Delay every 20 messages (default 5.0s).
+        inter_topic_delay: Delay after completing a topic copy (default 10.0s).
+        account: Optional account label.
+
+    Returns migration stats with copied/failed/skipped counts.
+    """
+    try:
+        cl = get_client(account)
+        source_entity = await resolve_entity(source_chat_id, cl)
+        target_entity = await resolve_entity(target_chat_id, cl)
+
+        # Fetch all messages from both topics
+        source_msgs = await _fetch_all_topic_messages(cl, source_entity, source_topic_id)
+        target_msgs = await _fetch_all_topic_messages(cl, target_entity, target_topic_id)
+
+        # Filter noise
+        source_filtered = [m for m in source_msgs if not _is_noise_message(m)]
+        target_filtered = [m for m in target_msgs if not _is_noise_message(m)]
+
+        # Build target index for comparison
+        target_index = await _build_message_index(target_filtered)
+
+        # Find missing messages (in source but not in target)
+        missing = []
+        for msg in source_filtered:
+            if resume_from_msg_id and msg.id <= resume_from_msg_id:
+                continue
+            raw_text = getattr(msg, "message", None) or ""
+            stripped = raw_text.strip()
+            has_media = getattr(msg, "media", None) is not None
+            media_type = None
+            if has_media:
+                if getattr(msg, "photo", None):
+                    media_type = "photo"
+                elif getattr(msg, "video", None):
+                    media_type = "video"
+                elif getattr(msg, "document", None):
+                    media_type = "document"
+                elif getattr(msg, "audio", None):
+                    media_type = "audio"
+                elif getattr(msg, "voice", None):
+                    media_type = "voice"
+                else:
+                    media_type = "media"
+            content_key = f"{stripped[:200]}|{media_type or 'text'}"
+            if content_key not in target_index:
+                missing.append(msg)
+
+        if limit and limit > 0:
+            missing = missing[:limit]
+
+        # Copy missing messages
+        copied = 0
+        failed = 0
+        skipped = 0
+        copied_ids = []
+
+        async def _send_with_retry(send_func, *args, **kwargs):
+            for attempt in range(3):
+                try:
+                    return await send_func(*args, **kwargs)
+                except FloodWaitError as e:
+                    wait_time = e.seconds + 5
+                    if wait_time > 1800:
+                        raise
+                    logger.warning(
+                        f"migrate_incremental FloodWait: waiting {wait_time}s (attempt {attempt+1}/3)"
+                    )
+                    await asyncio.sleep(wait_time)
+                except Exception as e:
+                    logger.error(f"migrate_incremental send error: {type(e).__name__}: {e}")
+                    raise
+            return await send_func(*args, **kwargs)
+
+        for i, msg in enumerate(missing):
+            try:
+                raw_text = getattr(msg, "message", None) or ""
+                stripped = raw_text.strip()
+                has_media = getattr(msg, "media", None) is not None
+                has_entities = bool(getattr(msg, "entities", None))
+
+                if not has_media and not has_entities and stripped in _NOISE_PATTERNS:
+                    skipped += 1
+                    continue
+                if not has_media and _BOT_COMMAND_PATTERN.fullmatch(stripped):
+                    skipped += 1
+                    continue
+
+                send_kwargs = {"reply_to": target_topic_id}
+
+                if has_media:
+                    send_kwargs["file"] = msg.media
+                    if raw_text:
+                        send_kwargs["caption"] = raw_text
+                        entities = getattr(msg, "entities", None)
+                        if entities:
+                            send_kwargs["formatting_entities"] = entities
+                    if hasattr(msg, "video") and msg.video:
+                        send_kwargs["supports_streaming"] = True
+                    await _send_with_retry(cl.send_file, target_entity, **send_kwargs)
+                elif raw_text:
+                    entities = getattr(msg, "entities", None)
+                    if entities:
+                        send_kwargs["formatting_entities"] = entities
+                    await _send_with_retry(cl.send_message, target_entity, raw_text, **send_kwargs)
+                else:
+                    skipped += 1
+                    continue
+
+                copied += 1
+                copied_ids.append(msg.id)
+                await asyncio.sleep(delay)
+
+                # Batch delay
+                if copied % 20 == 0 and batch_delay > 0:
+                    await asyncio.sleep(batch_delay)
+
+            except Exception as e:
+                failed += 1
+                logger.error(
+                    f"migrate_incremental message {msg.id} failed: {type(e).__name__}: {e}"
+                )
+                await asyncio.sleep(2)
+
+        # Inter-topic delay after completing
+        if inter_topic_delay > 0:
+            await asyncio.sleep(inter_topic_delay)
+
+        return format_tool_result(
+            [
+                {
+                    "source_chat_id": source_chat_id,
+                    "source_topic_id": source_topic_id,
+                    "target_chat_id": target_chat_id,
+                    "target_topic_id": target_topic_id,
+                    "copied": copied,
+                    "failed": failed,
+                    "skipped": skipped,
+                    "copied_ids": copied_ids,
+                    "resume_from_msg_id": resume_from_msg_id,
+                }
+            ]
+        )
+    except Exception as e:
+        logger.error(f"migrate_incremental error: {type(e).__name__}: {e}")
+        return log_and_format_error(
+            "migrate_incremental",
+            e,
+            source_chat_id=source_chat_id,
+            source_topic_id=source_topic_id,
+            target_chat_id=target_chat_id,
+            target_topic_id=target_topic_id,
+            resume_from_msg_id=resume_from_msg_id,
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Verify Topic Sync", openWorldHint=True, readOnlyHint=True)
+)
+@with_account(readonly=True)
+@validate_id("source_chat_id", "target_chat_id")
+async def verify_topic_sync(
+    source_chat_id: Union[int, str],
+    source_topic_id: int,
+    target_chat_id: Union[int, str],
+    target_topic_id: int,
+    tolerance: int = 0,
+    account: str = None,
+) -> str:
+    """
+    Verify that source and target topics are in sync (same message content).
+
+    Args:
+        source_chat_id: Source supergroup ID.
+        source_topic_id: Source topic ID.
+        target_chat_id: Target supergroup ID.
+        target_topic_id: Target topic ID.
+        tolerance: Allow this many extra messages in target (for noise).
+        account: Optional account label.
+
+    Returns verification result with sync status and details.
+    """
+    try:
+        cl = get_client(account)
+        source_entity = await resolve_entity(source_chat_id, cl)
+        target_entity = await resolve_entity(target_chat_id, cl)
+
+        source_msgs = await _fetch_all_topic_messages(cl, source_entity, source_topic_id)
+        target_msgs = await _fetch_all_topic_messages(cl, target_entity, target_topic_id)
+
+        source_filtered = [m for m in source_msgs if not _is_noise_message(m)]
+        target_filtered = [m for m in target_msgs if not _is_noise_message(m)]
+
+        source_index = await _build_message_index(source_filtered)
+        target_index = await _build_message_index(target_filtered)
+
+        missing = [k for k in source_index if k not in target_index]
+        extra = [k for k in target_index if k not in source_index]
+
+        is_synced = len(missing) == 0 and len(extra) <= tolerance
+
+        result = {
+            "source_chat_id": source_chat_id,
+            "source_topic_id": source_topic_id,
+            "target_chat_id": target_chat_id,
+            "target_topic_id": target_topic_id,
+            "synced": is_synced,
+            "source_count": len(source_filtered),
+            "target_count": len(target_filtered),
+            "missing_count": len(missing),
+            "extra_count": len(extra),
+            "tolerance": tolerance,
+            "missing_sample": missing[:10],
+            "extra_sample": extra[:10],
+        }
+
+        return format_tool_result([result])
+    except Exception as e:
+        logger.error(f"verify_topic_sync error: {type(e).__name__}: {e}")
+        return log_and_format_error(
+            "verify_topic_sync",
+            e,
+            source_chat_id=source_chat_id,
+            source_topic_id=source_topic_id,
+            target_chat_id=target_chat_id,
+            target_topic_id=target_topic_id,
+        )
+
+
 __all__ = [
     "get_chats",
     "list_topics",
@@ -1776,4 +2557,8 @@ __all__ = [
     "get_common_chats",
     "get_message_read_by",
     "get_message_link",
+    "compare_topics",
+    "cleanup_topic_noise",
+    "migrate_incremental",
+    "verify_topic_sync",
 ]
