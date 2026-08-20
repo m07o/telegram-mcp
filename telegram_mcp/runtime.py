@@ -336,7 +336,8 @@ clients: dict[str, TelegramClient] = _discover_accounts()
 
 def get_client(account: str = None) -> TelegramClient:
     """Resolve account label to TelegramClient."""
-    if account is None:
+    # Handle empty string from MCP tool calls (treated as "use default")
+    if account is None or account == "":
         if len(clients) == 1:
             return next(iter(clients.values()))
         raise ValueError(f"Account is required. Available accounts: {', '.join(clients.keys())}")

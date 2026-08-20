@@ -445,8 +445,9 @@ async def list_topics(
 
                 all_records.append(record)
 
-                # Respect limit even in fetch_all mode for safety
-                if len(all_records) >= limit:
+                # Only apply limit in fetch_all mode if explicitly set (not the default)
+                # When fetch_all=True, user explicitly wants all topics, so don't artificially limit
+                if not fetch_all and len(all_records) >= limit:
                     break
         else:
             # Manual pagination mode - single page

@@ -7,6 +7,7 @@ try:
 except UnsafeInstallationError as exc:
     raise SystemExit(str(exc)) from None
 
+import nest_asyncio
 from telegram_mcp import runtime as _runtime
 from telegram_mcp.runtime import *
 import telegram_mcp.tools  # noqa: F401 - registers MCP tools via decorators

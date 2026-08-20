@@ -12,5 +12,6 @@ from telegram_mcp.tools.events import *
 from telegram_mcp.tools.forum_forward import *
 from telegram_mcp.tools.content import *
 from telegram_mcp.tools.migration import *
+from telegram_mcp.tools.database import *
 
 __all__ = [name for name in globals() if not name.startswith("_")]

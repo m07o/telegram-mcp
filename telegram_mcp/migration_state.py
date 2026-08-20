@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -23,6 +24,29 @@ from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _atomic_write_json(path: Path, payload) -> None:
+    """Write *payload* to *path* atomically (temp file + ``os.replace``)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.stem}.", suffix=".tmp", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 @dataclass
@@ -68,6 +92,17 @@ class MigrationJob:
     skipped_topics: int = 0
     in_progress_topic_id: int | None = None
     config: dict[str, Any] = field(default_factory=dict)  # delay, batch_delay, etc.
+    # Overall job lifecycle status: "running", "complete", "aborted".
+    status: str = "running"
+    # Set to True by abort_migration(); the migration loop checks this and stops.
+    abort_requested: bool = False
+    # ISO timestamp of the abort request (for auditability).
+    aborted_at: str | None = None
+    # Optional webhook URL to POST to when the job finishes (see notify_on_complete).
+    webhook_url: str | None = None
+    webhook_secret: str | None = None
+    # When the job completed (successfully, partially, or via abort).
+    completed_at: str | None = None
 
     def __post_init__(self):
         if not self.created_at:
@@ -81,6 +116,21 @@ class MigrationJob:
 
     def set_topic(self, record: TopicMigrationRecord):
         self.topics[str(record.source_topic_id)] = record
+        self.update_timestamp()
+
+    def request_abort(self) -> None:
+        """Mark the job as aborted (abort_migration calls this)."""
+        self.abort_requested = True
+        self.aborted_at = datetime.now(timezone.utc).isoformat()
+        self.update_timestamp()
+
+    def is_aborted(self) -> bool:
+        return bool(self.abort_requested)
+
+    def mark_complete(self) -> None:
+        """Set the overall job status to ``complete`` and record completed_at."""
+        self.status = "complete"
+        self.completed_at = datetime.now(timezone.utc).isoformat()
         self.update_timestamp()
 
     def get_stats(self) -> dict[str, int]:
@@ -125,8 +175,7 @@ class MigrationStateStore:
         job.update_timestamp()
         path = self._path(job.job_id)
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self._serialize(job), f, ensure_ascii=False, indent=2)
+            _atomic_write_json(path, self._serialize(job))
         except OSError as e:
             logger.error(f"Failed to save migration state for {job.job_id}: {e}")
             raise
@@ -156,8 +205,27 @@ class MigrationStateStore:
 
 
 def generate_migration_job_id() -> str:
+    """Generate a fresh random migration job id.
+
+    Note: this id changes on every call, so a job created without an explicit
+    ``job_id`` cannot be safely resumed. Prefer :func:`derive_migration_job_id`
+    when resume support is required.
+    """
     import secrets
     return f"migrate_{secrets.token_hex(8)}"
+
+
+def derive_migration_job_id(source_chat_id: int | str, target_chat_id: int | str) -> str:
+    """Derive a STABLE job id from the source and target chats.
+
+    Using a deterministic id (instead of a random one) means that re-running
+    the migration with the same chats reuses the same on-disk state file, so
+    the job resumes from where it stopped instead of starting over and
+    re-copying messages. The returned id is filesystem-safe.
+    """
+    src = str(source_chat_id).replace("/", "_").replace("\\", "_")
+    dst = str(target_chat_id).replace("/", "_").replace("\\", "_")
+    return f"migrate_{src}_to_{dst}"
 
 
 __all__ = [
@@ -165,4 +233,5 @@ __all__ = [
     "MigrationJob",
     "MigrationStateStore",
     "generate_migration_job_id",
+    "derive_migration_job_id",
 ]

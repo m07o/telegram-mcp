@@ -3,6 +3,63 @@
 from telegram_mcp.runtime import *
 
 
+def get_media_label(msg) -> str:
+    """Short label of attached media for a message, or "" if none.
+
+    The media object is already present on the fetched message (msg.media /
+    msg.photo / msg.document etc.) — no extra API call needed. Surfacing it in
+    listings prevents the classic miss where a photo/file WITH a caption shows
+    up looking like a plain text message (Telethon puts the caption in
+    msg.message but the media stays in msg.media).
+    """
+    try:
+        # Link web preview is NOT an attachment. Check it FIRST: for a message with a
+        # link, Telethon returns the preview image via msg.photo; otherwise it would
+        # be incorrectly classified as a "photo".
+        if getattr(msg, "web_preview", None) is not None:
+            return ""
+        # Sticker/voice/video/audio/GIF are also represented as documents, so check
+        # them BEFORE the generic document handler.
+        sticker = getattr(msg, "sticker", None)
+        if sticker is not None:
+            alt = ""
+            for attr in getattr(sticker, "attributes", []) or []:
+                a = getattr(attr, "alt", None)
+                if a:
+                    alt = a
+                    break
+            return f"sticker {alt}".strip()
+        if getattr(msg, "photo", None) is not None:
+            return "photo"
+        if getattr(msg, "voice", None) is not None:
+            return "voice"
+        if getattr(msg, "video_note", None) is not None:
+            return "video_note"
+        if getattr(msg, "video", None) is not None:
+            return "video"
+        if getattr(msg, "audio", None) is not None:
+            return "audio"
+        if getattr(msg, "gif", None) is not None:
+            return "gif"
+        if getattr(msg, "document", None) is not None:
+            name = None
+            f = getattr(msg, "file", None)
+            if f is not None:
+                name = getattr(f, "name", None)
+            return f"document: {name}" if name else "document"
+        if getattr(msg, "contact", None) is not None:
+            return "contact"
+        if getattr(msg, "geo", None) is not None:
+            return "geo"
+        if getattr(msg, "poll", None) is not None:
+            return "poll"
+        if getattr(msg, "media", None) is not None:
+            return "media"
+        return ""
+    except Exception:
+        return ""
+
+
 @mcp.tool(annotations=ToolAnnotations(title="Send File", openWorldHint=True, destructiveHint=True))
 @with_account(readonly=False)
 @validate_id("chat_id")
@@ -418,6 +475,271 @@ async def send_gif(chat_id: Union[int, str], gif_id: int, account: str = None) -
         return log_and_format_error("send_gif", e, chat_id=chat_id, gif_id=gif_id)
 
 
+@mcp.tool(
+    annotations=ToolAnnotations(title="Publish Media with Template", openWorldHint=True, destructiveHint=True)
+)
+@with_account(readonly=False)
+@validate_id("target_chat_id")
+async def publish_media_with_template(
+    target_chat_id: Union[int, str],
+    target_topic_id: Union[int, str, None],
+    cleaned_text: str,
+    media_payload: Optional[Union[str, List[str]]] = None,
+    content_hash: str = None,
+    ctx: Optional[Context] = None,
+    account: str = None,
+) -> str:
+    """
+    Publish media with template to a target chat/topic with robust error handling and retry logic.
+    
+    Validation Rules:
+    - Verify that the message contains non-empty text OR valid attached media.
+    - If text becomes empty after cleaning and no media exists, return STATUS: EMPTY_AFTER_CLEANING.
+    - Check if the target topic exists and is accessible before sending.
+    
+    Retry Logic: Maximum 2 attempts with a 5-second delay between attempts for minor network failures.
+    
+    Exception Wrapping: Wrap all Telethon API calls in try/except blocks to prevent MCP server crashes.
+    Always return structured JSON responses.
+    
+    Args:
+        target_chat_id: Target chat ID or username
+        target_topic_id: Target topic/thread ID (optional)
+        cleaned_text: Pre-cleaned message text
+        media_payload: Optional file path(s) for media (single path or list for album)
+        content_hash: Content hash for deduplication (sha256:...)
+    
+    Returns:
+        JSON response with status and details
+    """
+    import asyncio
+    
+    # Validation: Check for empty content
+    has_text = bool(cleaned_text and cleaned_text.strip())
+    has_media = media_payload is not None
+    
+    if not has_text and not has_media:
+        return json.dumps({
+            "status": "EMPTY_AFTER_CLEANING",
+            "reason": "Message has no text content and no media attached"
+        }, default=json_serializer)
+    
+    # Validate content_hash format if provided
+    if content_hash and not content_hash.startswith("sha256:"):
+        return json.dumps({
+            "status": "FAILED_PARSING",
+            "reason": "Invalid content_hash format. Must start with 'sha256:'"
+        }, default=json_serializer)
+    
+    cl = get_client(account)
+    max_attempts = 2
+    base_delay = 5.0  # seconds
+    
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await ensure_connected(cl)
+            
+            # Resolve target entity
+            target_entity = await resolve_entity(target_chat_id, cl)
+            
+            # Validate topic if provided
+            if target_topic_id is not None:
+                topic_valid = await _validate_topic_access(cl, target_entity, target_topic_id)
+                if not topic_valid:
+                    return json.dumps({
+                        "status": "FAILED_TOPIC_ERROR",
+                        "reason": "Topic does not exist or permission denied"
+                    }, default=json_serializer)
+            
+            # Prepare message parameters
+            kwargs = {}
+            if target_topic_id is not None:
+                kwargs["reply_to"] = int(target_topic_id)
+            
+            # Send message with media if provided
+            if has_media:
+                if isinstance(media_payload, list):
+                    # Album: 2-10 files
+                    if not 2 <= len(media_payload) <= 10:
+                        return json.dumps({
+                            "status": "FAILED_PARSING",
+                            "reason": "Album must contain 2-10 files"
+                        }, default=json_serializer)
+                    
+                    safe_paths = []
+                    for file_path in media_payload:
+                        safe_path, path_error = await _resolve_readable_file_path(
+                            raw_path=file_path,
+                            ctx=ctx,
+                            tool_name="publish_media_with_template",
+                        )
+                        if path_error:
+                            return path_error
+                        safe_paths.append(str(safe_path))
+                    
+                    sent = await cl.send_file(
+                        target_entity,
+                        safe_paths,
+                        caption=cleaned_text if has_text else None,
+                        **kwargs
+                    )
+                    # For albums, sent is a list of messages
+                    target_msg_id = sent[0].id if sent else None
+                else:
+                    # Single file
+                    safe_path, path_error = await _resolve_readable_file_path(
+                        raw_path=media_payload,
+                        ctx=ctx,
+                        tool_name="publish_media_with_template",
+                    )
+                    if path_error:
+                        return path_error
+                    
+                    sent = await cl.send_file(
+                        target_entity,
+                        str(safe_path),
+                        caption=cleaned_text if has_text else None,
+                        **kwargs
+                    )
+                    target_msg_id = sent.id
+            else:
+                # Text only
+                sent = await cl.send_message(
+                    target_entity,
+                    cleaned_text,
+                    **kwargs
+                )
+                target_msg_id = sent.id
+            
+            # Success response
+            return json.dumps({
+                "status": "SUCCESS",
+                "target_message_id": target_msg_id,
+                "content_hash": content_hash
+            }, default=json_serializer)
+            
+        except asyncio.TimeoutError:
+            if attempt < max_attempts:
+                await asyncio.sleep(base_delay)
+                continue
+            return json.dumps({
+                "status": "FAILED_NETWORK",
+                "reason": "Connection timed out after 2 retries"
+            }, default=json_serializer)
+            
+        except Exception as e:
+            error_str = str(e).lower()
+            
+            # Check for FloodWait
+            if "flood" in error_str or "wait" in error_str:
+                # Try to extract wait time
+                import re
+                wait_match = re.search(r'(\d+)\s*seconds?', str(e))
+                wait_seconds = int(wait_match.group(1)) if wait_match else 45
+                return json.dumps({
+                    "status": "FAILED_FLOODWAIT",
+                    "wait_seconds": wait_seconds
+                }, default=json_serializer)
+            
+            # Check for topic-related errors
+            if "topic" in error_str and ("not found" in error_str or "permission" in error_str or "access" in error_str):
+                return json.dumps({
+                    "status": "FAILED_TOPIC_ERROR",
+                    "reason": "Topic not accessible or permission denied"
+                }, default=json_serializer)
+            
+            # Network/connection errors - retry
+            if any(term in error_str for term in ["connection", "timeout", "network", "disconnect"]):
+                if attempt < max_attempts:
+                    await asyncio.sleep(base_delay)
+                    continue
+                return json.dumps({
+                    "status": "FAILED_NETWORK",
+                    "reason": f"Connection failed after {max_attempts} retries: {str(e)[:200]}"
+                }, default=json_serializer)
+            
+            # Other errors - don't retry
+            return json.dumps({
+                "status": "FAILED_PARSING",
+                "reason": str(e)[:500]
+            }, default=json_serializer)
+    
+    # Should not reach here
+    return json.dumps({
+        "status": "FAILED_NETWORK",
+        "reason": "Max retries exceeded"
+    }, default=json_serializer)
+
+
+async def _validate_topic_access(client, chat_entity, topic_id: Union[int, str]) -> bool:
+    """Check if a topic exists and is accessible in a chat."""
+    try:
+        # Get the topic/message to verify it exists
+        topic_msg = await client.get_messages(chat_entity, ids=int(topic_id))
+        if not topic_msg:
+            return False
+        # Check if it's a forum topic
+        if not getattr(topic_msg, "forum_topic", False):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Validate Topic", readOnlyHint=True)
+)
+@with_account(readonly=True)
+@validate_id("chat_id")
+async def validate_topic(
+    chat_id: Union[int, str],
+    topic_id: Union[int, str],
+    account: str = None,
+) -> str:
+    """
+    Validate if a topic exists and is accessible for posting.
+    
+    Args:
+        chat_id: The chat ID or username
+        topic_id: The topic/thread ID to validate
+    
+    Returns:
+        JSON: {"valid": true/false, "can_post": true/false}
+    """
+    try:
+        cl = get_client(account)
+        await ensure_connected(cl)
+        
+        entity = await resolve_entity(chat_id, cl)
+        
+        # Get the topic message
+        topic_msg = await cl.get_messages(entity, ids=int(topic_id))
+        
+        if not topic_msg:
+            return json.dumps({"valid": False, "can_post": False}, default=json_serializer)
+        
+        # Check if it's a forum topic
+        is_topic = getattr(topic_msg, "forum_topic", False)
+        
+        if not is_topic:
+            return json.dumps({"valid": False, "can_post": False}, default=json_serializer)
+        
+        # Check if topic is closed/archived
+        is_closed = getattr(topic_msg, "closed", False)
+        
+        return json.dumps({
+            "valid": True,
+            "can_post": not is_closed
+        }, default=json_serializer)
+    
+    except Exception as e:
+        return log_and_format_error(
+            "validate_topic", e,
+            chat_id=chat_id,
+            topic_id=topic_id
+        )
+
+
 __all__ = [
     "send_file",
     "send_album",
@@ -429,4 +751,6 @@ __all__ = [
     "send_sticker",
     "get_gif_search",
     "send_gif",
+    "publish_media_with_template",
+    "validate_topic",
 ]

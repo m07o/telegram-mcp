@@ -15,12 +15,38 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _atomic_write_json(path: Path, payload) -> None:
+    """Write *payload* to *path* atomically (temp file + os.replace)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.stem}.", suffix=".tmp", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                # fsync may be unavailable on some filesystems; not fatal.
+                pass
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 @dataclass
@@ -73,10 +99,15 @@ class RefMap:
             return []
 
     def _save_job(self, job_id: str, entries: list[RefEntry]) -> None:
+        """Persist entries for *job_id* using an atomic write.
+
+        Writes to a temp file first, then ``os.replace``s it into place, so a
+        crash mid-write cannot leave a half-written (and thus unreadable) JSON
+        file. The previous entry list remains intact until the replace lands.
+        """
         path = self._job_file(job_id)
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump([e.to_dict() for e in entries], f, ensure_ascii=False, indent=2)
+            _atomic_write_json(path, [e.to_dict() for e in entries])
         except OSError as e:
             logger.error("Failed to save ref map for %s: %s", job_id, e)
             raise
