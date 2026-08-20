@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+<<<<<<< HEAD
 - **Phase 1 � Tool Discovery:** Two new read-only MCP tools:
   - `search_tools(query, category?)` � search tools by keyword across name, title, description; optional category filter (`messages`, `chats`, `media`, `admin`, `migration`, etc.).
   - `list_tool_categories()` � list all categories with tool counts and example tool names.
@@ -35,6 +36,33 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/).
 - Audit log never records secrets (session strings, API credentials, proxy URLs, message bodies).
 - `args_summary` only logs parameter names and string lengths when `TELEGRAM_AUDIT_LOG_ARGS=1`.
 - Audit I/O failures are non-fatal (warning logged, tool continues). — copy all forum topics between supergroups with resume support.
+=======
+- `search_tools` / `list_tool_categories` MCP tools — lightweight discovery over the
+  tool catalog (keyword search with AND semantics, category filter derived
+  dynamically from each tool's defining module), so clients can find tools without
+  loading every schema into context. No existing tool was renamed.
+- Exposure tiers for `TELEGRAM_EXPOSED_TOOLS`: `all`, `read-only`, `write`, `admin`,
+  `migration` (comma-separated lists combined by union). The `admin` tier is an
+  explicit allowlist (`ADMIN_TOOLS`) of elevated group-administration tools.
+- `telegram_mcp/audit.py` — opt-in JSONL audit log for tool calls
+  (`TELEGRAM_AUDIT_LOG`, opt-in `TELEGRAM_AUDIT_LOG_ARGS` records parameter names
+  only; argument values are never logged). Wired into the `with_account` choke
+  point, so every tool is covered.
+- Opt-in transient connection-error retry (`TELEGRAM_RETRY_TRANSIENT`, default 0,
+  capped at 5, exponential backoff with jitter) in the `with_account` wrapper.
+  Disabled by default because a reset mid-request can mean the operation already
+  reached Telegram (duplicate-message risk for send-type tools).
+- Tests for discovery, exposure tiers, audit logging, and transient retry
+  (`tests/test_tool_discovery.py`, `tests/test_audit.py`, `tests/test_retry.py`).
+
+- `forward_topics_from_group` MCP tool — copy all forum topics between supergroups with resume support.
+
+### Changed
+- Pinned `mcp[cli]` to `>=1.8.0,<2.0` in `pyproject.toml` and `requirements.txt`:
+  MCP SDK 2.x removed `mcp.server.fastmcp`, which broke server startup.
+- `runtime._get_exposed_tools_mode` now returns the validated list of tiers
+  instead of a single mode string.
+>>>>>>> origin/arena/01a01ce4-telegram-mcp
 - `job_store.py` — per-job JSON progress persistence for long-running operations.
 - `forum_pagination.py` — shared forum-topic pagination helper (`iter_forum_topics`, `build_topic_index`, `get_topic_title`, `extract_created_topic_id`).
 - `count_topics` MCP tool — returns the TRUE total topic count (paginating past 100-per-request limit), so AI agents don't truncate at the page boundary.

@@ -36,12 +36,13 @@ Message sent successfully:
 - [Docker](#docker)
 - [Development](#development)
 - [Security Notes](#security-notes)
+- [Audit Logging and Transient Retry](#audit-logging-and-transient-retry)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
 
 ## What It Can Do
 
-The server currently includes 80+ MCP tools grouped into these areas:
+The server currently includes 160+ MCP tools grouped into these areas:
 
 - **Accounts:** list configured accounts and route tool calls by account label.
 - **Chats and groups:** list chats, inspect metadata, create groups/channels, join or leave chats, invite users, manage admins, bans, default permissions, slow mode, topics, invite links, common chats, read receipts, and message links.
@@ -50,6 +51,7 @@ The server currently includes 80+ MCP tools grouped into these areas:
 - **Media:** send files, download media, upload files, send voice notes, stickers, GIFs, and inspect message media.
 - **Profile and privacy:** get your own account info, update profile fields, set or delete profile photos, inspect privacy settings, get user info/photos/status, and manage bot commands.
 - **Folders and drafts:** list, create, update, reorder, and delete Telegram folders; save, list, and clear drafts.
+- **Discovery:** `list_tool_categories` and `search_tools` let MCP clients browse or search the tool catalog by keyword/category without loading every tool schema into context.
 
 All tool results that include Telegram user-controlled content are sanitized and, where practical, returned as structured JSON.
 
@@ -113,6 +115,7 @@ TELEGRAM_API_HASH=your_api_hash_here
 TELEGRAM_SESSION_STRING=your_session_string_here
 ```
 
+<<<<<<< HEAD
 By default, all Telegram MCP tools are exposed. You can restrict the
 exposed tool surface using `TELEGRAM_EXPOSED_TOOLS`. This accepts a
 comma-separated list of exposure tiers:
@@ -134,12 +137,36 @@ TELEGRAM_EXPOSED_TOOLS=read-only,write
 
 # Full admin access including migration
 TELEGRAM_EXPOSED_TOOLS=all
+=======
+By default, all Telegram MCP tools are exposed. You can restrict the tool
+surface with `TELEGRAM_EXPOSED_TOOLS`. Accepted tiers (a single tier or a
+comma-separated list, combined by union):
+
+| Tier        | Keeps                                                        |
+|-------------|--------------------------------------------------------------|
+| `all`       | Every registered tool (the default)                          |
+| `read-only` | Tools annotated `readOnlyHint=True`                          |
+| `write`     | All other non-read-only tools                                |
+| `admin`     | Elevated group-administration tools (see `ADMIN_TOOLS` in `telegram_mcp/runtime.py`) |
+| `migration` | Tools defined in `telegram_mcp/tools/migration.py`           |
+
+```env
+# Read-only deployment
+TELEGRAM_EXPOSED_TOOLS=read-only
+# Read-only plus migration job tools (e.g. a worker that only inspects and migrates)
+TELEGRAM_EXPOSED_TOOLS=read-only,migration
+>>>>>>> origin/arena/01a01ce4-telegram-mcp
 ```
 
 This is an MCP tool-surface restriction, not a Telegram session sandbox or
 reduced Telegram account permission. The Telegram session string still has its
+<<<<<<< HEAD
 normal authority inside the server process; the tier filter only prevents
 tools from being registered and exposed through MCP.
+=======
+normal authority inside the server process; a restricted tier only prevents
+tools outside the selected tiers from being registered and exposed through MCP.
+>>>>>>> origin/arena/01a01ce4-telegram-mcp
 
 Run the server locally:
 
@@ -519,6 +546,7 @@ Telegram messages, display names, chat titles, and button labels are untrusted c
 - Tool descriptions that warn clients not to treat returned Telegram fields as model instructions.
 - No brittle keyword-based filtering.
 
+<<<<<<< HEAD
 ### Tool Discovery
 
 Two read-only discovery tools help clients navigate the ~180-tool surface:
@@ -549,6 +577,39 @@ Brief network blips and FloodWait escapes are absorbed automatically with expone
 Configure via env:
 - `TELEGRAM_MAX_RETRIES=2` (default)
 - Retry logic hooks into the `with_account` choke point, so all tools benefit.
+=======
+## Audit Logging and Transient Retry
+
+### Audit logging
+
+Every tool call can be traced by appending JSON lines (one per call) to a file.
+Disabled by default; enable with:
+
+```env
+TELEGRAM_AUDIT_LOG=/var/log/telegram-mcp/audit.jsonl
+```
+
+Each line contains a UTC timestamp, tool name, account label, and outcome
+(`ok`, or the exception class name on failure). Argument **values are never
+logged** — set `TELEGRAM_AUDIT_LOG_ARGS=1` to also record parameter *names*.
+Audit write failures are swallowed (logged as a warning) so they can never
+break a tool call.
+
+### Transient retry
+
+A connection reset or timeout mid-request is ambiguous: the operation may
+already have reached Telegram, and blindly retrying a send-type tool could
+duplicate messages. Telethon already handles FloodWait and transport-level
+retries internally, so a central retry is **opt-in**:
+
+```env
+# Retry transient connection errors up to 2 times (backoff 1s, 2s, ... capped 10s).
+TELEGRAM_RETRY_TRANSIENT=2
+```
+
+Default is `0` (disabled). Only `ConnectionError`/`TimeoutError` are eligible;
+server-side RPC errors are never retried.
+>>>>>>> origin/arena/01a01ce4-telegram-mcp
 
 ## Troubleshooting
 

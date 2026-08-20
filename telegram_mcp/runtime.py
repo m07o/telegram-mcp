@@ -3,6 +3,7 @@ import asyncio
 import os
 import sys
 import json
+import random
 import time
 import sqlite3
 import logging
@@ -44,7 +45,11 @@ import re
 from functools import wraps
 import telethon.errors.rpcerrorlist
 from sanitize import sanitize_user_content, sanitize_name, sanitize_dict, format_tool_result
+<<<<<<< HEAD
 from telegram_mcp.audit import audit_tool_call
+=======
+from telegram_mcp import audit
+>>>>>>> origin/arena/01a01ce4-telegram-mcp
 from telegram_mcp.client_identity import client_identity_kwargs
 
 
@@ -143,6 +148,7 @@ _install_annotation_hook()
 
 _EXPOSED_TOOLS_MODES = {"all", "read-only", "write", "admin", "migration"}
 
+<<<<<<< HEAD
 
 # Explicit admin tool names (from groups.py and chats.py)
 _ADMIN_TOOL_NAMES = {
@@ -227,11 +233,30 @@ def _get_tool_tier_map(server: FastMCP = None) -> dict[str, str]:
 
 
 _TOOL_TIER_MAP: dict[str, str] = {}
+=======
+# Admin-tier tools: group administration operations with elevated impact.
+# Kept as an explicit, auditable list (not annotation-based) so the exact
+# tools a "admin" deployment can call are always visible here.
+ADMIN_TOOLS: frozenset = frozenset(
+    {
+        "promote_admin",
+        "demote_admin",
+        "edit_admin_rights",
+        "ban_user",
+        "unban_user",
+        "ban_users_bulk",
+        "unban_users_bulk",
+        "set_default_chat_permissions",
+        "toggle_slow_mode",
+    }
+)
+>>>>>>> origin/arena/01a01ce4-telegram-mcp
 
 
-def _get_exposed_tools_mode(value: Optional[str] = None) -> str:
-    """Return the configured MCP tool exposure mode.
+def _get_exposed_tools_mode(value: Optional[str] = None) -> list[str]:
+    """Return the configured MCP tool exposure tiers, validated.
 
+<<<<<<< HEAD
     ``TELEGRAM_EXPOSED_TOOLS=read-only,write`` keeps tools from the specified tiers.
     Accepts comma-separated list of tiers. The default is ``all`` for backward compatibility.
     Valid tiers: all, read-only, write, admin, migration
@@ -251,19 +276,73 @@ def _get_exposed_tools_mode(value: Optional[str] = None) -> str:
         return mode  # Return the full comma-separated string
 
     if mode not in _EXPOSED_TOOLS_MODES:
+=======
+    ``TELEGRAM_EXPOSED_TOOLS`` accepts a single tier or a comma-separated
+    list, e.g. ``read-only,write``. Tiers:
+
+    - ``all``: every registered tool (default, backward compatible).
+    - ``read-only``: tools annotated ``readOnlyHint=True``.
+    - ``write``: all other non-read-only tools.
+    - ``admin``: elevated group-administration tools (see ``ADMIN_TOOLS``).
+    - ``migration``: tools defined in ``telegram_mcp.tools.migration``.
+
+    Multiple tiers are combined by union. Unknown values fail fast at
+    startup with ``SystemExit``.
+    """
+    raw_value = os.getenv("TELEGRAM_EXPOSED_TOOLS", "all") if value is None else value
+    tiers = [part.strip().lower() for part in raw_value.split(",") if part.strip()]
+    if not tiers:
+        tiers = ["all"]
+    invalid = [tier for tier in tiers if tier not in _EXPOSED_TOOLS_MODES]
+    if invalid:
+>>>>>>> origin/arena/01a01ce4-telegram-mcp
         accepted = ", ".join(sorted(_EXPOSED_TOOLS_MODES))
         raise SystemExit(
-            f"Invalid TELEGRAM_EXPOSED_TOOLS '{raw_value}'. Expected one of: {accepted}."
+            f"Invalid TELEGRAM_EXPOSED_TOOLS '{raw_value}'. "
+            f"Expected one of (or a comma-separated list of): {accepted}."
         )
-    return mode
+    # De-duplicate while preserving order.
+    seen = set()
+    ordered = []
+    for tier in tiers:
+        if tier not in seen:
+            seen.add(tier)
+            ordered.append(tier)
+    return ordered
+
+
+def _tool_tier(tool) -> str:
+    """Classify a registered tool into exactly one exposure tier.
+
+    Classification is least-privilege first: a read-only tool is always
+    ``read-only`` even if defined in the migration module, and an admin
+    tool is never ``write``.
+    """
+    annotations = getattr(tool, "annotations", None)
+    if getattr(annotations, "readOnlyHint", False):
+        return "read-only"
+    if tool.name in ADMIN_TOOLS:
+        return "admin"
+    fn = getattr(tool, "fn", None)
+    module = getattr(fn, "__module__", "") or ""
+    if module == "telegram_mcp.tools.migration":
+        return "migration"
+    return "write"
 
 
 def _apply_exposed_tools_mode(server: FastMCP = mcp, mode: Optional[str] = None) -> list[str]:
-    """Prune registered MCP tools according to the configured exposure mode."""
-    selected_mode = _get_exposed_tools_mode() if mode is None else _get_exposed_tools_mode(mode)
-    if selected_mode == "all":
+    """Prune registered MCP tools according to the configured exposure tiers.
+
+    A tool is kept when its tier (see ``_tool_tier``) is among the selected
+    tiers, or when ``all`` is selected. Returns the names of removed tools.
+    """
+    selected_tiers = (
+        _get_exposed_tools_mode() if mode is None else _get_exposed_tools_mode(mode)
+    )
+    if "all" in selected_tiers:
         return []
 
+<<<<<<< HEAD
     # Parse comma-separated tiers
     requested_tiers = [t.strip() for t in selected_mode.split(",")]
 
@@ -272,6 +351,12 @@ def _apply_exposed_tools_mode(server: FastMCP = mcp, mode: Optional[str] = None)
     for tool in list(server._tool_manager.list_tools()):
         tool_tier = tier_map.get(tool.name, "write")
         if tool_tier not in requested_tiers:
+=======
+    allowed = set(selected_tiers)
+    removed: list[str] = []
+    for tool in list(server._tool_manager.list_tools()):
+        if _tool_tier(tool) not in allowed:
+>>>>>>> origin/arena/01a01ce4-telegram-mcp
             server._tool_manager.remove_tool(tool.name)
             removed.append(tool.name)
     return removed
@@ -575,6 +660,35 @@ def is_multi_mode() -> bool:
     return len(clients) > 1
 
 
+# Connection-level errors eligible for optional transient retry. Kept
+# deliberately narrow: server-side RPC errors are NOT retried here because
+# they are unambiguous outcomes, and retrying send-type tools on them could
+# duplicate side effects.
+_TRANSIENT_EXCEPTIONS = (ConnectionError, TimeoutError)
+
+
+def _get_transient_retry_count() -> int:
+    """Return how many times transient connection errors may be retried.
+
+    ``TELEGRAM_RETRY_TRANSIENT`` (default ``0`` = disabled). Capped at 5.
+    Opt-in by design: a reset mid-request may mean the operation already
+    reached Telegram, so automatic retries are a safety valve for flaky
+    networks, not the default behavior.
+    """
+    raw = os.getenv("TELEGRAM_RETRY_TRANSIENT", "0")
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid TELEGRAM_RETRY_TRANSIENT '%s'; defaulting to 0", raw)
+        return 0
+    return max(0, min(value, 5))
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Exponential backoff (1s, 2s, 4s, ...) capped at 10s, plus jitter."""
+    return min(2 ** (attempt - 1), 10.0) + random.uniform(0, 0.5)
+
+
 def with_account(readonly=False):
     """Decorator that adds multi-account support to MCP tools.
 
@@ -589,6 +703,54 @@ def with_account(readonly=False):
     """
 
     def decorator(fn):
+        tool_name = getattr(fn, "__name__", "unknown")
+
+        async def _invoke(account_label, *args, **kwargs):
+            """Single invocation with optional transient retry and audit.
+
+            Retry is OPT-IN (``TELEGRAM_RETRY_TRANSIENT``, default 0) because
+            a connection reset mid-request is ambiguous — the operation may
+            already have reached Telegram, and a blind retry of a send-type
+            tool could duplicate messages. Only connection-level errors
+            (``ConnectionError``/``TimeoutError``) are eligible; Telethon
+            already handles FloodWait and server-level retries internally.
+            """
+            arg_names = [k for k in kwargs if k != "account"]
+            max_retries = _get_transient_retry_count()
+            attempt = 0
+            while True:
+                try:
+                    result = await fn(*args, **kwargs)
+                    audit.record_audit(
+                        tool_name=tool_name,
+                        account=account_label,
+                        ok=True,
+                        arg_names=arg_names,
+                    )
+                    return result
+                except Exception as exc:
+                    if isinstance(exc, _TRANSIENT_EXCEPTIONS) and attempt < max_retries:
+                        attempt += 1
+                        delay = _backoff_delay(attempt)
+                        logger.warning(
+                            "Transient error in %s (%s); retry %d/%d in %.1fs",
+                            tool_name,
+                            type(exc).__name__,
+                            attempt,
+                            max_retries,
+                            delay,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    audit.record_audit(
+                        tool_name=tool_name,
+                        account=account_label,
+                        ok=False,
+                        error=type(exc).__name__,
+                        arg_names=arg_names,
+                    )
+                    raise
+
         @wraps(fn)
         async def wrapper(*args, **kwargs):
             account = kwargs.get("account")
@@ -623,7 +785,11 @@ def with_account(readonly=False):
 
             # Explicit account OR single-mode -> call once
             if account is not None or not is_multi_mode():
+<<<<<<< HEAD
                 return await _call_with_retry_and_audit(fn, args, kwargs, effective_account)
+=======
+                return await _invoke(account, *args, **kwargs)
+>>>>>>> origin/arena/01a01ce4-telegram-mcp
 
             # account is None AND multi-mode
             if not readonly:
@@ -636,7 +802,11 @@ def with_account(readonly=False):
             async def _call_for(label):
                 kw = dict(kwargs)
                 kw["account"] = label
+<<<<<<< HEAD
                 return label, await _call_with_retry_and_audit(fn, args, kw, label)
+=======
+                return label, await _invoke(label, *args, **kw)
+>>>>>>> origin/arena/01a01ce4-telegram-mcp
 
             results = await asyncio.gather(*(_call_for(label) for label in clients))
             return "\n\n".join(f"[{label}]\n{result}" for label, result in results)
