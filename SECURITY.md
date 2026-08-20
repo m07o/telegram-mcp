@@ -15,10 +15,6 @@ Include:
 - Potential impact
 - Suggested fix (if any)
 
-## Scope
-
-This project handles Telegram session strings, which grant full access to a Telegram account. Security issues that could expose session strings, API credentials, or enable unauthorized access to Telegram accounts are critical.
-
 ## Response Time
 
 We aim to acknowledge reports within 48 hours and provide a fix or mitigation within 7 days for critical issues.
@@ -29,3 +25,75 @@ We aim to acknowledge reports within 48 hours and provide a fix or mitigation wi
 - **API credentials** (`TELEGRAM_API_ID`, `TELEGRAM_API_HASH`) should never be committed or logged.
 - **File-path security** restricts which files the MCP server can access. Bypassing this is a security issue.
 - **Prompt injection** — Telegram content (messages, names, titles) is untrusted. The server sanitizes returned content, but MCP clients should not treat returned Telegram fields as model instructions.
+
+## Exposure Tiers (`TELEGRAM_EXPOSED_TOOLS`)
+
+The server supports fine-grained tool exposure tiers to implement least-privilege MCP configurations:
+
+| Tier | Description | Example Tools |
+|------|-------------|---------------|
+| `read-only` | `readOnlyHint=True` tools only | `get_chats`, `list_topics`, `list_contacts`, `get_history` |
+| `write` | Non-read-only data mutation | `send_message`, `edit_message`, `forward_message` |
+| `admin` | Requires Telegram admin rights | `promote_admin`, `ban_user`, `edit_chat_title`, `create_forum_topic` |
+| `migration` | Migration module tools | `migrate_topics_autonomous`, `copy_topic_selective` |
+
+Configure via `TELEGRAM_EXPOSED_TOOLS` (comma-separated):
+- `all` (default) — all tiers
+- `read-only` — read-only only
+- `read-only,write` — read + write, no admin/migration
+- `read-only,write,admin` — no migration
+- `migration` — migration only
+
+Invalid tier values cause fast-fail at startup with the accepted list.
+
+**Security Note:** This is an MCP registration filter, not a Telegram permission sandbox. The underlying session retains its full Telegram authority.
+
+## Audit Log (`TELEGRAM_AUDIT_LOG`)
+
+When enabled, an append-only JSONL audit trail records every write/admin/migration tool call:
+
+```json
+{"timestamp":"2026-01-15T10:30:00Z","tool":"send_message","account":"default","tier":"write","ok":true}
+```
+
+Fields recorded:
+- `timestamp` (ISO 8601 UTC)
+- `tool` name
+- `account` label
+- `tier`
+- `ok` (boolean)
+- `error_category` (on failure, e.g., `CHAT`, `AUTH`)
+- `args_summary` (optional, `TELEGRAM_AUDIT_LOG_ARGS=1` — param names + lengths only, **never** message bodies, session strings, API credentials, or proxy URLs)
+
+Read-only tools excluded unless `TELEGRAM_AUDIT_LOG_ALL=1`. Audit I/O failures never crash tools (warning logged to `mcp_errors.log`).
+
+**Security Note:** The audit log itself must be protected — it reveals operational patterns. Restrict filesystem access accordingly.
+
+## Transient Error Retry (`TELEGRAM_MAX_RETRIES`)
+
+Automatic retry with exponential backoff (1s, 2s, capped 10s + jitter) for transient errors:
+- Connection errors, timeouts, server errors (5xx), FloodWait escapes
+- Non-transient: auth, validation, entity not found, user errors
+
+Default: `TELEGRAM_MAX_RETRIES=2`. Retry count reported in error result via `log_and_format_error`.
+
+## Docker Compose Example (Least-Privilege)
+
+```yaml
+services:
+  telegram-mcp-readonly:
+    image: telegram-mcp
+    environment:
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - TELEGRAM_SESSION_STRING=${TELEGRAM_SESSION_STRING}
+      - TELEGRAM_EXPOSED_TOOLS=read-only
+      - TELEGRAM_AUDIT_LOG=/data/audit.log
+      - TELEGRAM_AUDIT_LOG_ARGS=1
+      - TELEGRAM_MAX_RETRIES=2
+    volumes:
+      - ./audit:/data
+    read_only: true
+    cap_drop:
+      - ALL
+```
