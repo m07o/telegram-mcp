@@ -3,6 +3,7 @@ import asyncio
 import os
 import sys
 import json
+import random
 import time
 import sqlite3
 import logging
@@ -44,6 +45,7 @@ import re
 from functools import wraps
 import telethon.errors.rpcerrorlist
 from sanitize import sanitize_user_content, sanitize_name, sanitize_dict, format_tool_result
+from telegram_mcp import audit
 from telegram_mcp.client_identity import client_identity_kwargs
 
 
@@ -416,6 +418,35 @@ def is_multi_mode() -> bool:
     return len(clients) > 1
 
 
+# Connection-level errors eligible for optional transient retry. Kept
+# deliberately narrow: server-side RPC errors are NOT retried here because
+# they are unambiguous outcomes, and retrying send-type tools on them could
+# duplicate side effects.
+_TRANSIENT_EXCEPTIONS = (ConnectionError, TimeoutError)
+
+
+def _get_transient_retry_count() -> int:
+    """Return how many times transient connection errors may be retried.
+
+    ``TELEGRAM_RETRY_TRANSIENT`` (default ``0`` = disabled). Capped at 5.
+    Opt-in by design: a reset mid-request may mean the operation already
+    reached Telegram, so automatic retries are a safety valve for flaky
+    networks, not the default behavior.
+    """
+    raw = os.getenv("TELEGRAM_RETRY_TRANSIENT", "0")
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid TELEGRAM_RETRY_TRANSIENT '%s'; defaulting to 0", raw)
+        return 0
+    return max(0, min(value, 5))
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Exponential backoff (1s, 2s, 4s, ...) capped at 10s, plus jitter."""
+    return min(2 ** (attempt - 1), 10.0) + random.uniform(0, 0.5)
+
+
 def with_account(readonly=False):
     """Decorator that adds multi-account support to MCP tools.
 
@@ -430,13 +461,61 @@ def with_account(readonly=False):
     """
 
     def decorator(fn):
+        tool_name = getattr(fn, "__name__", "unknown")
+
+        async def _invoke(account_label, *args, **kwargs):
+            """Single invocation with optional transient retry and audit.
+
+            Retry is OPT-IN (``TELEGRAM_RETRY_TRANSIENT``, default 0) because
+            a connection reset mid-request is ambiguous — the operation may
+            already have reached Telegram, and a blind retry of a send-type
+            tool could duplicate messages. Only connection-level errors
+            (``ConnectionError``/``TimeoutError``) are eligible; Telethon
+            already handles FloodWait and server-level retries internally.
+            """
+            arg_names = [k for k in kwargs if k != "account"]
+            max_retries = _get_transient_retry_count()
+            attempt = 0
+            while True:
+                try:
+                    result = await fn(*args, **kwargs)
+                    audit.record_audit(
+                        tool_name=tool_name,
+                        account=account_label,
+                        ok=True,
+                        arg_names=arg_names,
+                    )
+                    return result
+                except Exception as exc:
+                    if isinstance(exc, _TRANSIENT_EXCEPTIONS) and attempt < max_retries:
+                        attempt += 1
+                        delay = _backoff_delay(attempt)
+                        logger.warning(
+                            "Transient error in %s (%s); retry %d/%d in %.1fs",
+                            tool_name,
+                            type(exc).__name__,
+                            attempt,
+                            max_retries,
+                            delay,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    audit.record_audit(
+                        tool_name=tool_name,
+                        account=account_label,
+                        ok=False,
+                        error=type(exc).__name__,
+                        arg_names=arg_names,
+                    )
+                    raise
+
         @wraps(fn)
         async def wrapper(*args, **kwargs):
             account = kwargs.get("account")
 
             # Explicit account OR single-mode -> call once
             if account is not None or not is_multi_mode():
-                return await fn(*args, **kwargs)
+                return await _invoke(account, *args, **kwargs)
 
             # account is None AND multi-mode
             if not readonly:
@@ -447,7 +526,7 @@ def with_account(readonly=False):
             async def _call_for(label):
                 kw = dict(kwargs)
                 kw["account"] = label
-                return label, await fn(*args, **kw)
+                return label, await _invoke(label, *args, **kw)
 
             results = await asyncio.gather(*(_call_for(label) for label in clients))
             return "\n\n".join(f"[{label}]\n{result}" for label, result in results)
