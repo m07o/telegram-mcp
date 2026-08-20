@@ -115,6 +115,29 @@ TELEGRAM_API_HASH=your_api_hash_here
 TELEGRAM_SESSION_STRING=your_session_string_here
 ```
 
+<<<<<<< HEAD
+By default, all Telegram MCP tools are exposed. You can restrict the
+exposed tool surface using `TELEGRAM_EXPOSED_TOOLS`. This accepts a
+comma-separated list of exposure tiers:
+
+- `all` (default): expose all ~180 tools
+- `read-only`: only tools annotated with `readOnlyHint=True` (search, list, get operations)
+- `write`: non-read-only tools that modify data (send messages, edit, etc.)
+- `admin`: tools requiring admin privileges (ban/promote, chat settings, forum management)
+- `migration`: tools in the migration module (bulk topic copy, autonomous migration)
+
+Examples:
+
+```env
+# Expose only read tools
+TELEGRAM_EXPOSED_TOOLS=read-only
+
+# Expose read and write, but not admin/migration
+TELEGRAM_EXPOSED_TOOLS=read-only,write
+
+# Full admin access including migration
+TELEGRAM_EXPOSED_TOOLS=all
+=======
 By default, all Telegram MCP tools are exposed. You can restrict the tool
 surface with `TELEGRAM_EXPOSED_TOOLS`. Accepted tiers (a single tier or a
 comma-separated list, combined by union):
@@ -132,12 +155,18 @@ comma-separated list, combined by union):
 TELEGRAM_EXPOSED_TOOLS=read-only
 # Read-only plus migration job tools (e.g. a worker that only inspects and migrates)
 TELEGRAM_EXPOSED_TOOLS=read-only,migration
+>>>>>>> origin/arena/01a01ce4-telegram-mcp
 ```
 
 This is an MCP tool-surface restriction, not a Telegram session sandbox or
 reduced Telegram account permission. The Telegram session string still has its
+<<<<<<< HEAD
+normal authority inside the server process; the tier filter only prevents
+tools from being registered and exposed through MCP.
+=======
 normal authority inside the server process; a restricted tier only prevents
 tools outside the selected tiers from being registered and exposed through MCP.
+>>>>>>> origin/arena/01a01ce4-telegram-mcp
 
 Run the server locally:
 
@@ -171,11 +200,11 @@ this project:
 }
 ```
 
-To expose only read-only tools in Claude Desktop or Cursor, add this to the
-server `env` block:
+To restrict exposed tools in Claude Desktop or Cursor, add `TELEGRAM_EXPOSED_TOOLS`
+to the server `env` block:
 
 ```json
-"TELEGRAM_EXPOSED_TOOLS": "read-only"
+"TELEGRAM_EXPOSED_TOOLS": "read-only,write"
 ```
 
 Alternatively, install this repository directly from GitHub into a virtual
@@ -517,6 +546,38 @@ Telegram messages, display names, chat titles, and button labels are untrusted c
 - Tool descriptions that warn clients not to treat returned Telegram fields as model instructions.
 - No brittle keyword-based filtering.
 
+<<<<<<< HEAD
+### Tool Discovery
+
+Two read-only discovery tools help clients navigate the ~180-tool surface:
+
+- `search_tools(query, category?)` — search tools by keyword across name, title, and description. Optional category filter (e.g., `messages`, `chats`, `media`, `admin`, `migration`).
+- `list_tool_categories()` — list all categories with tool counts and example tool names.
+
+Both are registered with `readOnlyHint=True` and respect the `TELEGRAM_EXPOSED_TOOLS` tier filter.
+
+### Audit Log (Write Operations)
+
+Enable an append-only JSONL audit trail for write/admin/migration operations by setting `TELEGRAM_AUDIT_LOG=/path/to/audit.log`. Each line contains:
+
+- `timestamp` (ISO 8601 UTC)
+- `tool` name
+- `account` label
+- `tier` (read-only/write/admin/migration)
+- `ok` (boolean)
+- `error_category` (on failure)
+- `args_summary` (optional, enabled by `TELEGRAM_AUDIT_LOG_ARGS=1` — parameter names + string lengths only, never message bodies or secrets)
+
+Read-only tools are excluded unless `TELEGRAM_AUDIT_LOG_ALL=1`. Audit I/O failures never crash the tool (warning logged instead).
+
+### Transient Error Retry
+
+Brief network blips and FloodWait escapes are absorbed automatically with exponential backoff (1s, 2s, capped 10s + jitter) up to `TELEGRAM_MAX_RETRIES` (default 2). Retried attempts are reported in the error result via `log_and_format_error`. Non-transient errors (auth, validation, entity not found) are never retried.
+
+Configure via env:
+- `TELEGRAM_MAX_RETRIES=2` (default)
+- Retry logic hooks into the `with_account` choke point, so all tools benefit.
+=======
 ## Audit Logging and Transient Retry
 
 ### Audit logging
@@ -548,6 +609,7 @@ TELEGRAM_RETRY_TRANSIENT=2
 
 Default is `0` (disabled). Only `ConnectionError`/`TimeoutError` are eligible;
 server-side RPC errors are never retried.
+>>>>>>> origin/arena/01a01ce4-telegram-mcp
 
 ## Troubleshooting
 

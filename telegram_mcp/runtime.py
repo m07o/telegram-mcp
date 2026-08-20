@@ -45,7 +45,11 @@ import re
 from functools import wraps
 import telethon.errors.rpcerrorlist
 from sanitize import sanitize_user_content, sanitize_name, sanitize_dict, format_tool_result
+<<<<<<< HEAD
+from telegram_mcp.audit import audit_tool_call
+=======
 from telegram_mcp import audit
+>>>>>>> origin/arena/01a01ce4-telegram-mcp
 from telegram_mcp.client_identity import client_identity_kwargs
 
 
@@ -144,6 +148,92 @@ _install_annotation_hook()
 
 _EXPOSED_TOOLS_MODES = {"all", "read-only", "write", "admin", "migration"}
 
+<<<<<<< HEAD
+
+# Explicit admin tool names (from groups.py and chats.py)
+_ADMIN_TOOL_NAMES = {
+    # groups.py - admin management
+    "promote_admin",
+    "demote_admin",
+    "ban_user",
+    "unban_user",
+    "edit_admin_rights",
+    "set_default_chat_permissions",
+    "toggle_slow_mode",
+    # groups.py - chat settings (require admin rights)
+    "edit_chat_title",
+    "edit_chat_photo",
+    "edit_chat_about",
+    "delete_chat_photo",
+    # groups.py - bulk admin
+    "ban_users_bulk",
+    "unban_users_bulk",
+    # chats.py - forum management (require admin)
+    "enable_forum_topics",
+    "create_forum_topic",
+    "delete_topic_by_title",
+    # chats.py - chat moderation
+    "mute_chat",
+    "unmute_chat",
+    "archive_chat",
+    "unarchive_chat",
+}
+
+
+def _build_tool_tier_map(server: FastMCP = None) -> dict[str, str]:
+    """Build a map of tool name -> tier by inspecting registered tools.
+
+    Tiers:
+    - read-only: tools annotated with readOnlyHint=True
+    - migration: tools defined in telegram_mcp.tools.migration
+    - admin: explicit set of admin tool names
+    - write: all remaining non-read-only tools
+    """
+    if server is None:
+        server = mcp
+    tier_map: dict[str, str] = {}
+    for tool in server._tool_manager.list_tools():
+        func = getattr(tool, "fn", None)
+        if func is None:
+            continue
+        tool_name = tool.name
+        annotations = getattr(tool, "annotations", None)
+
+        # Check if it's a migration tool (by module)
+        module_name = getattr(func, "__module__", "")
+        if module_name == "telegram_mcp.tools.migration":
+            tier_map[tool_name] = "migration"
+            continue
+
+        # Check if it's an admin tool (by explicit name)
+        if tool_name in _ADMIN_TOOL_NAMES:
+            tier_map[tool_name] = "admin"
+            continue
+
+        # Check if read-only
+        if getattr(annotations, "readOnlyHint", False):
+            tier_map[tool_name] = "read-only"
+            continue
+
+        # Default to write
+        tier_map[tool_name] = "write"
+    return tier_map
+
+
+def _get_tool_tier_map(server: FastMCP = None) -> dict[str, str]:
+    """Get the tool-to-tier map, building it lazily on first use."""
+    global _TOOL_TIER_MAP
+    if server is None:
+        # Use cached global map for the main server
+        if not _TOOL_TIER_MAP:
+            _TOOL_TIER_MAP = _build_tool_tier_map()
+        return _TOOL_TIER_MAP
+    # For test servers, build fresh each time
+    return _build_tool_tier_map(server)
+
+
+_TOOL_TIER_MAP: dict[str, str] = {}
+=======
 # Admin-tier tools: group administration operations with elevated impact.
 # Kept as an explicit, auditable list (not annotation-based) so the exact
 # tools a "admin" deployment can call are always visible here.
@@ -160,11 +250,33 @@ ADMIN_TOOLS: frozenset = frozenset(
         "toggle_slow_mode",
     }
 )
+>>>>>>> origin/arena/01a01ce4-telegram-mcp
 
 
 def _get_exposed_tools_mode(value: Optional[str] = None) -> list[str]:
     """Return the configured MCP tool exposure tiers, validated.
 
+<<<<<<< HEAD
+    ``TELEGRAM_EXPOSED_TOOLS=read-only,write`` keeps tools from the specified tiers.
+    Accepts comma-separated list of tiers. The default is ``all`` for backward compatibility.
+    Valid tiers: all, read-only, write, admin, migration
+    """
+    raw_value = os.getenv("TELEGRAM_EXPOSED_TOOLS", "all") if value is None else value
+    mode = raw_value.strip().lower()
+
+    # Handle comma-separated list
+    if "," in mode:
+        tiers = [t.strip() for t in mode.split(",") if t.strip()]
+        for tier in tiers:
+            if tier not in _EXPOSED_TOOLS_MODES:
+                accepted = ", ".join(sorted(_EXPOSED_TOOLS_MODES))
+                raise SystemExit(
+                    f"Invalid TELEGRAM_EXPOSED_TOOLS '{raw_value}'. Expected one of: {accepted}."
+                )
+        return mode  # Return the full comma-separated string
+
+    if mode not in _EXPOSED_TOOLS_MODES:
+=======
     ``TELEGRAM_EXPOSED_TOOLS`` accepts a single tier or a comma-separated
     list, e.g. ``read-only,write``. Tiers:
 
@@ -183,6 +295,7 @@ def _get_exposed_tools_mode(value: Optional[str] = None) -> list[str]:
         tiers = ["all"]
     invalid = [tier for tier in tiers if tier not in _EXPOSED_TOOLS_MODES]
     if invalid:
+>>>>>>> origin/arena/01a01ce4-telegram-mcp
         accepted = ", ".join(sorted(_EXPOSED_TOOLS_MODES))
         raise SystemExit(
             f"Invalid TELEGRAM_EXPOSED_TOOLS '{raw_value}'. "
@@ -229,14 +342,143 @@ def _apply_exposed_tools_mode(server: FastMCP = mcp, mode: Optional[str] = None)
     if "all" in selected_tiers:
         return []
 
+<<<<<<< HEAD
+    # Parse comma-separated tiers
+    requested_tiers = [t.strip() for t in selected_mode.split(",")]
+
+    tier_map = _get_tool_tier_map(server)
+    removed: list[str] = []
+    for tool in list(server._tool_manager.list_tools()):
+        tool_tier = tier_map.get(tool.name, "write")
+        if tool_tier not in requested_tiers:
+=======
     allowed = set(selected_tiers)
     removed: list[str] = []
     for tool in list(server._tool_manager.list_tools()):
         if _tool_tier(tool) not in allowed:
+>>>>>>> origin/arena/01a01ce4-telegram-mcp
             server._tool_manager.remove_tool(tool.name)
             removed.append(tool.name)
     return removed
 
+
+# ---------------------------------------------------------------------------
+# Transient error retry logic
+# ---------------------------------------------------------------------------
+
+
+def _get_max_retries() -> int:
+    """Get max retries from env, default 2."""
+    try:
+        return int(os.getenv("TELEGRAM_MAX_RETRIES", "2"))
+    except ValueError:
+        return 2
+
+
+def _is_transient_error(error: Exception) -> bool:
+    """Determine if an error is transient and should be retried.
+
+    Transient: connection issues, timeouts, server errors, flood wait.
+    Non-transient: auth, validation, entity not found, user errors.
+    """
+    from telethon import errors as telethon_errors
+
+    # Connection-level errors (network issues)
+    if isinstance(error, (ConnectionError, OSError, asyncio.TimeoutError)):
+        return True
+
+    # Telethon RPC errors - check specific types
+    if isinstance(error, telethon_errors.RPCError):
+        # Server errors (5xx) are transient
+        if isinstance(error, telethon_errors.ServerError):
+            return True
+        # Timeout errors
+        if isinstance(error, (telethon_errors.TimedOutError, telethon_errors.TimeoutError)):
+            return True
+        # Network migration
+        if isinstance(error, telethon_errors.NetworkMigrateError):
+            return True
+        # Flood wait - Telethon handles this internally, but just in case
+        if isinstance(error, telethon_errors.FloodWaitError):
+            return True
+
+        # Non-transient errors - don't retry
+        # Auth errors
+        if isinstance(error, (
+            telethon_errors.AuthKeyError,
+            telethon_errors.AuthKeyInvalidError,
+            telethon_errors.AuthKeyUnregisteredError,
+            telethon_errors.UnauthorizedError,
+            telethon_errors.SessionExpiredError,
+            telethon_errors.SessionRevokedError,
+        )):
+            return False
+        # Validation / bad request errors
+        if isinstance(error, telethon_errors.BadRequestError):
+            return False
+        # Entity not found / invalid
+        if isinstance(error, (
+            telethon_errors.PeerIdInvalidError,
+            telethon_errors.ChannelInvalidError,
+            telethon_errors.ChatInvalidError,
+            telethon_errors.UserInvalidError,
+            telethon_errors.ChannelPrivateError,
+            telethon_errors.ChatForbiddenError,
+            telethon_errors.UserNotParticipantError,
+        )):
+            return False
+        # User-specific errors
+        if isinstance(error, (
+            telethon_errors.UserDeactivatedError,
+            telethon_errors.UserDeactivatedBanError,
+            telethon_errors.UserBlockedError,
+            telethon_errors.UserIsBlockedError,
+            telethon_errors.YouBlockedUserError,
+            telethon_errors.UserPrivacyRestrictedError,
+        )):
+            return False
+
+    # Default: treat unknown RPC errors as non-transient for safety
+    if isinstance(error, telethon_errors.RPCError):
+        return False
+
+    # Other exceptions - be conservative
+    return False
+
+
+async def _retry_with_backoff(fn, *args, max_retries: int = None, **kwargs):
+    """Execute fn with exponential backoff retry on transient errors."""
+    if max_retries is None:
+        max_retries = _get_max_retries()
+
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            return await fn(*args, **kwargs)
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries and _is_transient_error(e):
+                # Exponential backoff: 1s, 2s, 4s... capped at 10s, plus jitter
+                base_delay = min(2 ** attempt, 10)
+                jitter = random.uniform(0, 0.5)
+                delay = base_delay + jitter
+                logger.warning(
+                    f"Transient error in {fn.__name__} (attempt {attempt + 1}/{max_retries + 1}): {e}. "
+                    f"Retrying in {delay:.1f}s..."
+                )
+                await asyncio.sleep(delay)
+            else:
+                # Non-transient or max retries reached
+                break
+
+    # All retries exhausted or non-transient error
+    # Attach attempt count to error for reporting
+    if last_error:
+        last_error._retry_attempts = max_retries + 1
+    raise last_error
+
+
+import random
 
 # ---------------------------------------------------------------------------
 # Multi-account configuration
@@ -512,21 +754,59 @@ def with_account(readonly=False):
         @wraps(fn)
         async def wrapper(*args, **kwargs):
             account = kwargs.get("account")
+            tool_name = fn.__name__
+            tier = _get_tool_tier_map().get(tool_name, "write")
+            is_readonly = tier == "read-only" or readonly
+
+            # Determine effective account label for audit
+            effective_account = account
+            if effective_account is None or effective_account == "":
+                if len(clients) == 1:
+                    effective_account = next(iter(clients.keys()))
+                else:
+                    effective_account = "multi"
+
+            async def _call_with_retry_and_audit(fn, args, kwargs, account_label):
+                """Call fn with retry and audit logging."""
+                try:
+                    result = await _retry_with_backoff(fn, *args, **kwargs)
+                    audit_tool_call(tool_name, account_label, tier, is_readonly, True, None, kwargs)
+                    return result
+                except Exception as e:
+                    audit_tool_call(tool_name, account_label, tier, is_readonly, False, e, kwargs)
+                    # Format error with attempt count
+                    attempts = getattr(e, "_retry_attempts", 1)
+                    if attempts > 1:
+                        return log_and_format_error(
+                            tool_name, e,
+                            user_message=f"Failed after {attempts} attempts: {e}"
+                        )
+                    raise
 
             # Explicit account OR single-mode -> call once
             if account is not None or not is_multi_mode():
+<<<<<<< HEAD
+                return await _call_with_retry_and_audit(fn, args, kwargs, effective_account)
+=======
                 return await _invoke(account, *args, **kwargs)
+>>>>>>> origin/arena/01a01ce4-telegram-mcp
 
             # account is None AND multi-mode
             if not readonly:
                 labels = ", ".join(clients.keys())
-                return f"Error: 'account' is required. Available accounts: {labels}"
+                error_msg = f"Error: 'account' is required. Available accounts: {labels}"
+                audit_tool_call(tool_name, effective_account, tier, is_readonly, False, ValueError(error_msg), kwargs)
+                return error_msg
 
             # Read-only fan-out to all accounts concurrently
             async def _call_for(label):
                 kw = dict(kwargs)
                 kw["account"] = label
+<<<<<<< HEAD
+                return label, await _call_with_retry_and_audit(fn, args, kw, label)
+=======
                 return label, await _invoke(label, *args, **kw)
+>>>>>>> origin/arena/01a01ce4-telegram-mcp
 
             results = await asyncio.gather(*(_call_for(label) for label in clients))
             return "\n\n".join(f"[{label}]\n{result}" for label, result in results)
