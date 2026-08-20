@@ -7,7 +7,34 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
-- `forward_topics_from_group` MCP tool â€” copy all forum topics between supergroups with resume support.
+- **Phase 1 — Tool Discovery:** Two new read-only MCP tools:
+  - `search_tools(query, category?)` — search tools by keyword across name, title, description; optional category filter (`messages`, `chats`, `media`, `admin`, `migration`, etc.).
+  - `list_tool_categories()` — list all categories with tool counts and example tool names.
+  Both registered with `readOnlyHint=True` and respect `TELEGRAM_EXPOSED_TOOLS` tier filter.
+
+- **Phase 2 — Exposure Tiers:** Extended `TELEGRAM_EXPOSED_TOOLS` from two modes (`all`, `read-only`) to five tiers (`all`, `read-only`, `write`, `admin`, `migration`) with comma-separated list support. Backward compatible: `all` (default) and `read-only` behavior unchanged. Invalid values fail fast at startup with accepted list.
+
+- **Phase 3 — Audit Log:** New `telegram_mcp.audit` module with `TELEGRAM_AUDIT_LOG=/path` enabling append-only JSONL audit trail for write/admin/migration operations. Records timestamp, tool, account, tier, ok/error_category, and optional `args_summary` (param names + lengths only, enabled by `TELEGRAM_AUDIT_LOG_ARGS=1`). Read-only tools excluded unless `TELEGRAM_AUDIT_LOG_ALL=1`. Audit I/O failures never crash tools.
+
+- **Phase 4 — Transient Error Retry:** Automatic exponential backoff retry (1s, 2s, capped 10s + jitter) for transient errors (connection issues, timeouts, server errors, FloodWait escapes) up to `TELEGRAM_MAX_RETRIES` (default 2). Non-transient errors (auth, validation, entity not found) never retried. Attempt count reported in error result. Hooks into `with_account` choke point for universal coverage.
+
+- `telegram_mcp/audit.py` — audit logging module.
+- `telegram_mcp/tools/discovery.py` — tool discovery tools.
+- Tests: `tests/test_tool_discovery.py`, `tests/test_audit.py`, `tests/test_retry.py`.
+
+### Changed
+- `with_account` decorator now integrates audit logging and retry logic as universal cross-cutting concerns.
+- Exposure tier classification: read-only (annotation), migration (module), admin (explicit name set), write (default).
+- `_get_tool_tier_map()` and `_apply_exposed_tools_mode()` now accept optional server parameter for testability.
+
+### Fixed
+- Fixed syntax error in `with_account` return statement (broken string literal across multiple lines).
+- `_retry_with_backoff` correctly tracks attempt count on final error for reporting.
+
+### Security
+- Audit log never records secrets (session strings, API credentials, proxy URLs, message bodies).
+- `args_summary` only logs parameter names and string lengths when `TELEGRAM_AUDIT_LOG_ARGS=1`.
+- Audit I/O failures are non-fatal (warning logged, tool continues). â€” copy all forum topics between supergroups with resume support.
 - `job_store.py` â€” per-job JSON progress persistence for long-running operations.
 - `forum_pagination.py` â€” shared forum-topic pagination helper (`iter_forum_topics`, `build_topic_index`, `get_topic_title`, `extract_created_topic_id`).
 - `count_topics` MCP tool â€” returns the TRUE total topic count (paginating past 100-per-request limit), so AI agents don't truncate at the page boundary.
