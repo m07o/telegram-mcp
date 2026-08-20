@@ -40,6 +40,15 @@ def _synthetic_mcp():
     def write_tool():
         return "write"
 
+    # Set module names to match the tier classification logic
+    for tool in server._tool_manager.list_tools():
+        func = getattr(tool, "fn", None)
+        if func:
+            if tool.name == "read_tool":
+                func.__module__ = "telegram_mcp.tools.chats"
+            elif tool.name == "write_tool":
+                func.__module__ = "telegram_mcp.tools.messages"
+
     return server
 
 
@@ -77,6 +86,158 @@ def test_get_exposed_tools_mode_rejects_invalid_value(monkeypatch):
     assert "TELEGRAM_EXPOSED_TOOLS" in message
     assert "all" in message
     assert "read-only" in message
+
+
+def test_apply_exposed_tools_write_tier():
+    """Test that write tier includes non-read-only, non-admin, non-migration tools."""
+    server = FastMCP("test")
+
+    @server.tool(annotations=ToolAnnotations(title="Write Tool", destructiveHint=True))
+    def write_tool():
+        return "write"
+
+    @server.tool(annotations=ToolAnnotations(title="Read Tool", readOnlyHint=True))
+    def read_tool():
+        return "read"
+
+    # Set module names
+    for tool in server._tool_manager.list_tools():
+        func = getattr(tool, "fn", None)
+        if func:
+            if tool.name == "write_tool":
+                func.__module__ = "telegram_mcp.tools.messages"
+            elif tool.name == "read_tool":
+                func.__module__ = "telegram_mcp.tools.chats"
+
+    removed = runtime._apply_exposed_tools_mode(server, "write")
+    assert removed == ["read_tool"]
+    assert _tool_names(server) == {"write_tool"}
+
+
+def test_apply_exposed_tools_admin_tier():
+    """Test that admin tier includes explicit admin tools."""
+    server = FastMCP("test")
+
+    @server.tool(annotations=ToolAnnotations(title="Promote Admin", destructiveHint=True))
+    def promote_admin():
+        return "promote"
+
+    @server.tool(annotations=ToolAnnotations(title="Regular Write", destructiveHint=True))
+    def regular_write():
+        return "write"
+
+    @server.tool(annotations=ToolAnnotations(title="Read Tool", readOnlyHint=True))
+    def read_tool():
+        return "read"
+
+    # Set module names
+    for tool in server._tool_manager.list_tools():
+        func = getattr(tool, "fn", None)
+        if func:
+            if tool.name == "promote_admin":
+                func.__module__ = "telegram_mcp.tools.groups"
+            elif tool.name == "regular_write":
+                func.__module__ = "telegram_mcp.tools.messages"
+            elif tool.name == "read_tool":
+                func.__module__ = "telegram_mcp.tools.chats"
+
+    removed = runtime._apply_exposed_tools_mode(server, "admin")
+    # Should keep only admin tools (promote_admin)
+    assert "promote_admin" not in removed
+    assert "regular_write" in removed
+    assert "read_tool" in removed
+    assert _tool_names(server) == {"promote_admin"}
+
+
+def test_apply_exposed_tools_migration_tier():
+    """Test that migration tier includes tools from migration module."""
+    server = FastMCP("test")
+
+    @server.tool(annotations=ToolAnnotations(title="Migrate Tool", destructiveHint=True))
+    def migrate_topics_autonomous():
+        return "migrate"
+
+    @server.tool(annotations=ToolAnnotations(title="Regular Write", destructiveHint=True))
+    def regular_write():
+        return "write"
+
+    @server.tool(annotations=ToolAnnotations(title="Read Tool", readOnlyHint=True))
+    def read_tool():
+        return "read"
+
+    # Set module names
+    for tool in server._tool_manager.list_tools():
+        func = getattr(tool, "fn", None)
+        if func:
+            if tool.name == "migrate_topics_autonomous":
+                func.__module__ = "telegram_mcp.tools.migration"
+            elif tool.name == "regular_write":
+                func.__module__ = "telegram_mcp.tools.messages"
+            elif tool.name == "read_tool":
+                func.__module__ = "telegram_mcp.tools.chats"
+
+    removed = runtime._apply_exposed_tools_mode(server, "migration")
+    # Should keep only migration tools
+    assert "migrate_topics_autonomous" not in removed
+    assert "regular_write" in removed
+    assert "read_tool" in removed
+    assert _tool_names(server) == {"migrate_topics_autonomous"}
+
+
+def test_apply_exposed_tools_comma_separated():
+    """Test comma-separated tier list."""
+    server = FastMCP("test")
+
+    @server.tool(annotations=ToolAnnotations(title="Read", readOnlyHint=True))
+    def read_tool():
+        return "read"
+
+    @server.tool(annotations=ToolAnnotations(title="Write", destructiveHint=True))
+    def write_tool():
+        return "write"
+
+    @server.tool(annotations=ToolAnnotations(title="Admin", destructiveHint=True))
+    def promote_admin():
+        return "promote"
+
+    # Set module names
+    for tool in server._tool_manager.list_tools():
+        func = getattr(tool, "fn", None)
+        if func:
+            if tool.name == "read_tool":
+                func.__module__ = "telegram_mcp.tools.chats"
+            elif tool.name == "write_tool":
+                func.__module__ = "telegram_mcp.tools.messages"
+            elif tool.name == "promote_admin":
+                func.__module__ = "telegram_mcp.tools.groups"
+
+    removed = runtime._apply_exposed_tools_mode(server, "read-only,write")
+    assert "read_tool" not in removed
+    assert "write_tool" not in removed
+    assert "promote_admin" in removed
+    assert _tool_names(server) == {"read_tool", "write_tool"}
+
+
+def test_get_exposed_tools_mode_rejects_invalid_tier_in_list(monkeypatch):
+    """Test that invalid tier in comma-separated list fails."""
+    monkeypatch.setenv("TELEGRAM_EXPOSED_TOOLS", "read-only,invalid")
+
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._get_exposed_tools_mode()
+
+    message = str(excinfo.value)
+    assert "TELEGRAM_EXPOSED_TOOLS" in message
+    assert "invalid" in message
+
+
+def test_apply_exposed_tools_all_mode_unchanged():
+    """Test that 'all' mode keeps all tools (backward compatibility)."""
+    server = _synthetic_mcp()
+
+    removed = runtime._apply_exposed_tools_mode(server, "all")
+
+    assert removed == []
+    assert _tool_names(server) == {"read_tool", "write_tool"}
 
 
 def test_discover_accounts_supports_suffixed_and_default_sessions(monkeypatch):
