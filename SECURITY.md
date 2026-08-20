@@ -28,4 +28,14 @@ We aim to acknowledge reports within 48 hours and provide a fix or mitigation wi
 - **Session strings** grant full access to the associated Telegram account. Treat them like passwords.
 - **API credentials** (`TELEGRAM_API_ID`, `TELEGRAM_API_HASH`) should never be committed or logged.
 - **File-path security** restricts which files the MCP server can access. Bypassing this is a security issue.
+- **Tool-surface restriction** (`TELEGRAM_EXPOSED_TOOLS`) prunes which MCP tools are
+  registered. It is a tool-surface restriction, not a session sandbox: the session
+  string keeps its full authority inside the server process. The `admin` tier is
+  defined by an explicit, auditable allowlist (`ADMIN_TOOLS` in
+  `telegram_mcp/runtime.py`); adding a tool to that list is a security-relevant
+  change that must be reviewed.
+- **Audit logging** (`TELEGRAM_AUDIT_LOG`) never records tool argument values or
+  credentials — only tool names, account labels, outcomes, and (opt-in) parameter
+  names. A regression that logs argument values or session material is a security
+  issue.
 - **Prompt injection** — Telegram content (messages, names, titles) is untrusted. The server sanitizes returned content, but MCP clients should not treat returned Telegram fields as model instructions.

@@ -7,7 +7,55 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- `telegram_health_check` MCP tool — local-only diagnostics (no API calls):
+  accounts and session configuration (including file permissions), last
+  connection-verification time per account, persisted migration jobs, and
+  disk space for the media DB and allowed roots.
+- `TELEGRAM_MAX_RESULT_CHARS` — optional hard cap on tool result size. Results
+  above 150k chars always log a warning; when the cap is set, oversized
+  TextContent blocks are truncated with a visible marker to protect the LLM
+  context window.
+- `duration_ms` in audit log entries — every audited tool call now records its
+  wall-clock duration.
+- Startup validation for `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` — clear
+  `SystemExit` messages instead of a raw `TypeError` when the environment is
+  misconfigured.
+- Startup warning when a file-based session is readable by group/others
+  (session files are account credentials; recommends `chmod 600`).
+
+### Changed
+- Error codes in `log_and_format_error` now use `zlib.crc32` instead of
+  `hash()`, making them stable across processes and restarts (Python string
+  hashes are randomized per process, so the old codes changed on every run).
+- Untracked `telegram_media.db` (runtime SQLite media cache) and added `*.db*`
+  to `.gitignore`.
+- Moved one-off debug scripts (`fix_end.py`, `fix_migration.py`,
+  `rest_additions.py`, `test_pipeline.py`, `tools_inventory.py`) to `scripts/`.
+- `search_tools` / `list_tool_categories` MCP tools — lightweight discovery over the
+  tool catalog (keyword search with AND semantics, category filter derived
+  dynamically from each tool's defining module), so clients can find tools without
+  loading every schema into context. No existing tool was renamed.
+- Exposure tiers for `TELEGRAM_EXPOSED_TOOLS`: `all`, `read-only`, `write`, `admin`,
+  `migration` (comma-separated lists combined by union). The `admin` tier is an
+  explicit allowlist (`ADMIN_TOOLS`) of elevated group-administration tools.
+- `telegram_mcp/audit.py` — opt-in JSONL audit log for tool calls
+  (`TELEGRAM_AUDIT_LOG`, opt-in `TELEGRAM_AUDIT_LOG_ARGS` records parameter names
+  only; argument values are never logged). Wired into the `with_account` choke
+  point, so every tool is covered.
+- Opt-in transient connection-error retry (`TELEGRAM_RETRY_TRANSIENT`, default 0,
+  capped at 5, exponential backoff with jitter) in the `with_account` wrapper.
+  Disabled by default because a reset mid-request can mean the operation already
+  reached Telegram (duplicate-message risk for send-type tools).
+- Tests for discovery, exposure tiers, audit logging, and transient retry
+  (`tests/test_tool_discovery.py`, `tests/test_audit.py`, `tests/test_retry.py`).
+
 - `forward_topics_from_group` MCP tool — copy all forum topics between supergroups with resume support.
+
+### Changed
+- Pinned `mcp[cli]` to `>=1.8.0,<2.0` in `pyproject.toml` and `requirements.txt`:
+  MCP SDK 2.x removed `mcp.server.fastmcp`, which broke server startup.
+- `runtime._get_exposed_tools_mode` now returns the validated list of tiers
+  instead of a single mode string.
 - `job_store.py` — per-job JSON progress persistence for long-running operations.
 - `forum_pagination.py` — shared forum-topic pagination helper (`iter_forum_topics`, `build_topic_index`, `get_topic_title`, `extract_created_topic_id`).
 - `count_topics` MCP tool — returns the TRUE total topic count (paginating past 100-per-request limit), so AI agents don't truncate at the page boundary.

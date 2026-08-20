@@ -378,6 +378,8 @@ async def list_topics(
 
     IMPORTANT: Telegram returns topics in pages of max 100. To get ALL topics,
     you MUST pass fetch_all=True (do not assume limit=100 returns everything).
+    When a single page comes back full, the result JSON includes a "warning"
+    field — never treat a result without "total_topics" as complete.
     To get just the count, use count_topics instead — it's faster.
     For manual pagination: pass offset_topic = the last topic ID from the previous batch.
     To RESUME a migration from a specific topic ID (e.g., 28068), set offset_topic=28068
@@ -413,10 +415,13 @@ async def list_topics(
         normalized_search = normalize_forum_title(search_query) if search_query else None
 
         all_records = []
+        fetched_total = 0
+        raw_page_full = False
 
         if fetch_all:
             # Use the shared pagination helper to get ALL topics
             async for topic in iter_forum_topics(cl, entity, page_size=limit):
+                fetched_total += 1
                 title = getattr(topic, "title", None) or "(no title)"
 
                 if normalized_search:
@@ -469,6 +474,8 @@ async def list_topics(
             topics = getattr(result, "topics", None) or []
             if not topics:
                 return "No topics found for this chat."
+            # A full page means Telegram very likely has more topics.
+            raw_page_full = len(topics) >= limit
 
             messages_map = {}
             if getattr(result, "messages", None):
@@ -508,7 +515,22 @@ async def list_topics(
         if not all_records:
             return "No topics found for this chat."
 
-        return format_tool_result(all_records)
+        # Make truncation visible IN the result: an agent that ignores the
+        # docstring must not be able to mistake one 100-topic page for the
+        # complete list.
+        metadata = {}
+        if fetch_all:
+            metadata["total_topics"] = fetched_total
+            if normalized_search:
+                metadata["matched_topics"] = len(all_records)
+        elif raw_page_full:
+            metadata["warning"] = (
+                "This is ONE page only: Telegram returns max 100 topics per "
+                "request and this page is full, so more topics likely exist. "
+                "Use count_topics for the total count, or call list_topics "
+                "again with fetch_all=True to get every topic."
+            )
+        return format_tool_result(all_records, metadata or None)
     except Exception as e:
         return log_and_format_error(
             "list_topics",

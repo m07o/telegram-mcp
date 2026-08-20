@@ -3,7 +3,9 @@ import asyncio
 import os
 import sys
 import json
+import random
 import time
+import zlib
 import sqlite3
 import logging
 import mimetypes
@@ -18,7 +20,7 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.types import Annotations, TextContent, ToolAnnotations
 from mcp.shared.exceptions import McpError
-from pythonjsonlogger import jsonlogger
+from pythonjsonlogger.json import JsonFormatter
 from telethon import TelegramClient, functions, types, utils
 from telethon.sessions import StringSession
 from telethon.tl.types import (
@@ -44,6 +46,7 @@ import re
 from functools import wraps
 import telethon.errors.rpcerrorlist
 from sanitize import sanitize_user_content, sanitize_name, sanitize_dict, format_tool_result
+from telegram_mcp import audit
 from telegram_mcp.client_identity import client_identity_kwargs
 
 
@@ -102,8 +105,31 @@ try:
 except Exception as e:
     print(f"WARNING: Failed to load .env file: {e}", file=sys.stderr)
 
-TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
+def _require_env_int(name: str) -> int:
+    """Read a required integer env var with a friendly failure message."""
+    raw = os.getenv(name)
+    if not raw or not raw.strip():
+        raise SystemExit(
+            f"Missing required environment variable {name}. "
+            "Get TELEGRAM_API_ID and TELEGRAM_API_HASH from "
+            "https://my.telegram.org/apps and set them in your environment or .env."
+        )
+    try:
+        return int(raw)
+    except ValueError:
+        raise SystemExit(
+            f"Environment variable {name} must be an integer, got {raw!r}."
+        ) from None
+
+
+TELEGRAM_API_ID = _require_env_int("TELEGRAM_API_ID")
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
+if not TELEGRAM_API_HASH or not TELEGRAM_API_HASH.strip():
+    raise SystemExit(
+        "Missing required environment variable TELEGRAM_API_HASH. "
+        "Get it from https://my.telegram.org/apps and set it in your "
+        "environment or .env."
+    )
 
 mcp = FastMCP("telegram")
 
@@ -112,6 +138,55 @@ mcp = FastMCP("telegram")
 # We wrap the low-level request handler (after FastMCP registers it) to inject
 # annotations into the final CallToolResult, preserving structured output.
 _USER_AUDIENCE = Annotations(audience=["user"])
+
+
+_RESULT_WARN_CHARS = 150_000
+_RESULT_TRUNCATION_MARKER = "\n…[truncated by TELEGRAM_MAX_RESULT_CHARS]"
+
+
+def _get_max_result_chars() -> Optional[int]:
+    """Optional hard cap on tool result size (``TELEGRAM_MAX_RESULT_CHARS``)."""
+    raw = os.getenv("TELEGRAM_MAX_RESULT_CHARS")
+    if not raw or not raw.strip():
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid TELEGRAM_MAX_RESULT_CHARS %r; ignoring it", raw)
+        return None
+    return value if value > 0 else None
+
+
+def _apply_result_size_policy(content: list, tool_name: str = "unknown") -> list:
+    """Warn on oversized results; truncate when TELEGRAM_MAX_RESULT_CHARS is set.
+
+    By default the result is left intact (so structured JSON stays valid) and
+    only a warning is logged. Setting ``TELEGRAM_MAX_RESULT_CHARS`` truncates
+    every TextContent block above the cap and appends a visible marker.
+    """
+    total_chars = sum(len(b.text) for b in content if isinstance(b, TextContent))
+    if total_chars > _RESULT_WARN_CHARS:
+        logger.warning(
+            "Tool %s returned a large result (%d chars; warn threshold %d); "
+            "consider pagination or a result limit",
+            tool_name,
+            total_chars,
+            _RESULT_WARN_CHARS,
+        )
+    cap = _get_max_result_chars()
+    if not cap:
+        return content
+    truncated = []
+    for block in content:
+        if isinstance(block, TextContent) and len(block.text) > cap:
+            truncated.append(
+                block.model_copy(
+                    update={"text": block.text[:cap] + _RESULT_TRUNCATION_MARKER}
+                )
+            )
+        else:
+            truncated.append(block)
+    return truncated
 
 
 def _install_annotation_hook() -> None:
@@ -124,7 +199,7 @@ def _install_annotation_hook() -> None:
         if isinstance(response, ServerResult) and isinstance(response.root, CallToolResult):
             content = response.root.content
             if content:
-                response.root.content = [
+                annotated = [
                     (
                         block.model_copy(update={"annotations": _USER_AUDIENCE})
                         if isinstance(block, TextContent) and block.annotations is None
@@ -132,6 +207,8 @@ def _install_annotation_hook() -> None:
                     )
                     for block in content
                 ]
+                tool_name = getattr(req.params, "name", None) or "unknown"
+                response.root.content = _apply_result_size_policy(annotated, tool_name)
         return response
 
     mcp._mcp_server.request_handlers[CallToolRequest] = annotated_handler
@@ -140,35 +217,97 @@ def _install_annotation_hook() -> None:
 _install_annotation_hook()
 
 
-_EXPOSED_TOOLS_MODES = {"all", "read-only"}
+_EXPOSED_TOOLS_MODES = {"all", "read-only", "write", "admin", "migration"}
+
+# Admin-tier tools: group administration operations with elevated impact.
+# Kept as an explicit, auditable list (not annotation-based) so the exact
+# tools a "admin" deployment can call are always visible here.
+ADMIN_TOOLS: frozenset = frozenset(
+    {
+        "promote_admin",
+        "demote_admin",
+        "edit_admin_rights",
+        "ban_user",
+        "unban_user",
+        "ban_users_bulk",
+        "unban_users_bulk",
+        "set_default_chat_permissions",
+        "toggle_slow_mode",
+    }
+)
 
 
-def _get_exposed_tools_mode(value: Optional[str] = None) -> str:
-    """Return the configured MCP tool exposure mode.
+def _get_exposed_tools_mode(value: Optional[str] = None) -> list[str]:
+    """Return the configured MCP tool exposure tiers, validated.
 
-    ``TELEGRAM_EXPOSED_TOOLS=read-only`` keeps only tools annotated with
-    ``readOnlyHint=True``. The default is ``all`` for backward compatibility.
+    ``TELEGRAM_EXPOSED_TOOLS`` accepts a single tier or a comma-separated
+    list, e.g. ``read-only,write``. Tiers:
+
+    - ``all``: every registered tool (default, backward compatible).
+    - ``read-only``: tools annotated ``readOnlyHint=True``.
+    - ``write``: all other non-read-only tools.
+    - ``admin``: elevated group-administration tools (see ``ADMIN_TOOLS``).
+    - ``migration``: tools defined in ``telegram_mcp.tools.migration``.
+
+    Multiple tiers are combined by union. Unknown values fail fast at
+    startup with ``SystemExit``.
     """
     raw_value = os.getenv("TELEGRAM_EXPOSED_TOOLS", "all") if value is None else value
-    mode = raw_value.strip().lower()
-    if mode not in _EXPOSED_TOOLS_MODES:
+    tiers = [part.strip().lower() for part in raw_value.split(",") if part.strip()]
+    if not tiers:
+        tiers = ["all"]
+    invalid = [tier for tier in tiers if tier not in _EXPOSED_TOOLS_MODES]
+    if invalid:
         accepted = ", ".join(sorted(_EXPOSED_TOOLS_MODES))
         raise SystemExit(
-            f"Invalid TELEGRAM_EXPOSED_TOOLS '{raw_value}'. Expected one of: {accepted}."
+            f"Invalid TELEGRAM_EXPOSED_TOOLS '{raw_value}'. "
+            f"Expected one of (or a comma-separated list of): {accepted}."
         )
-    return mode
+    # De-duplicate while preserving order.
+    seen = set()
+    ordered = []
+    for tier in tiers:
+        if tier not in seen:
+            seen.add(tier)
+            ordered.append(tier)
+    return ordered
+
+
+def _tool_tier(tool) -> str:
+    """Classify a registered tool into exactly one exposure tier.
+
+    Classification is least-privilege first: a read-only tool is always
+    ``read-only`` even if defined in the migration module, and an admin
+    tool is never ``write``.
+    """
+    annotations = getattr(tool, "annotations", None)
+    if getattr(annotations, "readOnlyHint", False):
+        return "read-only"
+    if tool.name in ADMIN_TOOLS:
+        return "admin"
+    fn = getattr(tool, "fn", None)
+    module = getattr(fn, "__module__", "") or ""
+    if module == "telegram_mcp.tools.migration":
+        return "migration"
+    return "write"
 
 
 def _apply_exposed_tools_mode(server: FastMCP = mcp, mode: Optional[str] = None) -> list[str]:
-    """Prune registered MCP tools according to the configured exposure mode."""
-    selected_mode = _get_exposed_tools_mode() if mode is None else _get_exposed_tools_mode(mode)
-    if selected_mode == "all":
+    """Prune registered MCP tools according to the configured exposure tiers.
+
+    A tool is kept when its tier (see ``_tool_tier``) is among the selected
+    tiers, or when ``all`` is selected. Returns the names of removed tools.
+    """
+    selected_tiers = (
+        _get_exposed_tools_mode() if mode is None else _get_exposed_tools_mode(mode)
+    )
+    if "all" in selected_tiers:
         return []
 
+    allowed = set(selected_tiers)
     removed: list[str] = []
     for tool in list(server._tool_manager.list_tools()):
-        annotations = getattr(tool, "annotations", None)
-        if not getattr(annotations, "readOnlyHint", False):
+        if _tool_tier(tool) not in allowed:
             server._tool_manager.remove_tool(tool.name)
             removed.append(tool.name)
     return removed
@@ -331,7 +470,36 @@ def _discover_accounts() -> dict[str, TelegramClient]:
     return accounts
 
 
+def _warn_world_readable_sessions() -> None:
+    """Warn at startup when a file-based session is readable by group/others.
+
+    A session file is effectively the account's password; 0644 means anyone
+    on the host can read it. Warning (not failing) so an operator can fix
+    the permissions without losing access to a running deployment.
+    """
+    for label, cl in clients.items():
+        session = getattr(cl, "session", None)
+        session_file = getattr(session, "session_file", None)
+        if not isinstance(session_file, str):
+            continue
+        try:
+            mode = os.stat(session_file).st_mode & 0o777
+        except OSError:
+            continue
+        if mode & 0o007:
+            logger.warning(
+                "Session file for account %r (%s) is readable by group/others "
+                "(mode %03o). A session file is the account's credential — "
+                "run: chmod 600 %s",
+                label,
+                session_file,
+                mode,
+                session_file,
+            )
+
+
 clients: dict[str, TelegramClient] = _discover_accounts()
+_warn_world_readable_sessions()
 
 
 def get_client(account: str = None) -> TelegramClient:
@@ -354,6 +522,35 @@ def is_multi_mode() -> bool:
     return len(clients) > 1
 
 
+# Connection-level errors eligible for optional transient retry. Kept
+# deliberately narrow: server-side RPC errors are NOT retried here because
+# they are unambiguous outcomes, and retrying send-type tools on them could
+# duplicate side effects.
+_TRANSIENT_EXCEPTIONS = (ConnectionError, TimeoutError)
+
+
+def _get_transient_retry_count() -> int:
+    """Return how many times transient connection errors may be retried.
+
+    ``TELEGRAM_RETRY_TRANSIENT`` (default ``0`` = disabled). Capped at 5.
+    Opt-in by design: a reset mid-request may mean the operation already
+    reached Telegram, so automatic retries are a safety valve for flaky
+    networks, not the default behavior.
+    """
+    raw = os.getenv("TELEGRAM_RETRY_TRANSIENT", "0")
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid TELEGRAM_RETRY_TRANSIENT '%s'; defaulting to 0", raw)
+        return 0
+    return max(0, min(value, 5))
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Exponential backoff (1s, 2s, 4s, ...) capped at 10s, plus jitter."""
+    return min(2 ** (attempt - 1), 10.0) + random.uniform(0, 0.5)
+
+
 def with_account(readonly=False):
     """Decorator that adds multi-account support to MCP tools.
 
@@ -368,13 +565,64 @@ def with_account(readonly=False):
     """
 
     def decorator(fn):
+        tool_name = getattr(fn, "__name__", "unknown")
+
+        async def _invoke(account_label, *args, **kwargs):
+            """Single invocation with optional transient retry and audit.
+
+            Retry is OPT-IN (``TELEGRAM_RETRY_TRANSIENT``, default 0) because
+            a connection reset mid-request is ambiguous — the operation may
+            already have reached Telegram, and a blind retry of a send-type
+            tool could duplicate messages. Only connection-level errors
+            (``ConnectionError``/``TimeoutError``) are eligible; Telethon
+            already handles FloodWait and server-level retries internally.
+            """
+            arg_names = [k for k in kwargs if k != "account"]
+            max_retries = _get_transient_retry_count()
+            attempt = 0
+            started = time.monotonic()
+            while True:
+                try:
+                    result = await fn(*args, **kwargs)
+                    audit.record_audit(
+                        tool_name=tool_name,
+                        account=account_label,
+                        ok=True,
+                        arg_names=arg_names,
+                        duration_ms=(time.monotonic() - started) * 1000,
+                    )
+                    return result
+                except Exception as exc:
+                    if isinstance(exc, _TRANSIENT_EXCEPTIONS) and attempt < max_retries:
+                        attempt += 1
+                        delay = _backoff_delay(attempt)
+                        logger.warning(
+                            "Transient error in %s (%s); retry %d/%d in %.1fs",
+                            tool_name,
+                            type(exc).__name__,
+                            attempt,
+                            max_retries,
+                            delay,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    audit.record_audit(
+                        tool_name=tool_name,
+                        account=account_label,
+                        ok=False,
+                        error=type(exc).__name__,
+                        arg_names=arg_names,
+                        duration_ms=(time.monotonic() - started) * 1000,
+                    )
+                    raise
+
         @wraps(fn)
         async def wrapper(*args, **kwargs):
             account = kwargs.get("account")
 
             # Explicit account OR single-mode -> call once
             if account is not None or not is_multi_mode():
-                return await fn(*args, **kwargs)
+                return await _invoke(account, *args, **kwargs)
 
             # account is None AND multi-mode
             if not readonly:
@@ -385,7 +633,7 @@ def with_account(readonly=False):
             async def _call_for(label):
                 kw = dict(kwargs)
                 kw["account"] = label
-                return label, await fn(*args, **kw)
+                return label, await _invoke(label, *args, **kw)
 
             results = await asyncio.gather(*(_call_for(label) for label in clients))
             return "\n\n".join(f"[{label}]\n{result}" for label, result in results)
@@ -474,7 +722,7 @@ try:
     console_handler.setFormatter(console_formatter)
 
     # File formatter is now JSON
-    json_formatter = jsonlogger.JsonFormatter(
+    json_formatter = JsonFormatter(
         "%(asctime)s %(name)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S%z",
     )
@@ -567,7 +815,11 @@ def log_and_format_error(
                     break
 
         prefix_str = prefix.value if isinstance(prefix, ErrorCategory) else (prefix or "GEN")
-        error_code = f"{prefix_str}-ERR-{abs(hash(function_name)) % 1000:03d}"
+        # crc32 (unlike hash()) is stable across processes and restarts, so
+        # error codes can be correlated between log files and runs.
+        error_code = (
+            f"{prefix_str}-ERR-{zlib.crc32(function_name.encode('utf-8')) % 1000:03d}"
+        )
 
     # Format the additional context parameters
     context = ", ".join(f"{k}={v}" for k, v in kwargs.items())

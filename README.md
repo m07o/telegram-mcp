@@ -36,12 +36,13 @@ Message sent successfully:
 - [Docker](#docker)
 - [Development](#development)
 - [Security Notes](#security-notes)
+- [Audit Logging and Transient Retry](#audit-logging-and-transient-retry)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
 
 ## What It Can Do
 
-The server currently includes 80+ MCP tools grouped into these areas:
+The server currently includes 160+ MCP tools grouped into these areas:
 
 - **Accounts:** list configured accounts and route tool calls by account label.
 - **Chats and groups:** list chats, inspect metadata, create groups/channels, join or leave chats, invite users, manage admins, bans, default permissions, slow mode, topics, invite links, common chats, read receipts, and message links.
@@ -50,6 +51,8 @@ The server currently includes 80+ MCP tools grouped into these areas:
 - **Media:** send files, download media, upload files, send voice notes, stickers, GIFs, and inspect message media.
 - **Profile and privacy:** get your own account info, update profile fields, set or delete profile photos, inspect privacy settings, get user info/photos/status, and manage bot commands.
 - **Folders and drafts:** list, create, update, reorder, and delete Telegram folders; save, list, and clear drafts.
+- **Discovery:** `list_tool_categories` and `search_tools` let MCP clients browse or search the tool catalog by keyword/category without loading every tool schema into context.
+- **Diagnostics:** `telegram_health_check` reports server health locally (no API calls): account/session configuration and file permissions, last connection verification, persisted migration jobs, and disk space.
 
 All tool results that include Telegram user-controlled content are sanitized and, where practical, returned as structured JSON.
 
@@ -113,20 +116,29 @@ TELEGRAM_API_HASH=your_api_hash_here
 TELEGRAM_SESSION_STRING=your_session_string_here
 ```
 
-By default, all Telegram MCP tools are exposed. If you want to prevent MCP
-clients from sending messages or performing chat/account mutations, set
-`TELEGRAM_EXPOSED_TOOLS=read-only` to expose only tools annotated with
-`readOnlyHint=True`:
+By default, all Telegram MCP tools are exposed. You can restrict the tool
+surface with `TELEGRAM_EXPOSED_TOOLS`. Accepted tiers (a single tier or a
+comma-separated list, combined by union):
+
+| Tier        | Keeps                                                        |
+|-------------|--------------------------------------------------------------|
+| `all`       | Every registered tool (the default)                          |
+| `read-only` | Tools annotated `readOnlyHint=True`                          |
+| `write`     | All other non-read-only tools                                |
+| `admin`     | Elevated group-administration tools (see `ADMIN_TOOLS` in `telegram_mcp/runtime.py`) |
+| `migration` | Tools defined in `telegram_mcp/tools/migration.py`           |
 
 ```env
+# Read-only deployment
 TELEGRAM_EXPOSED_TOOLS=read-only
+# Read-only plus migration job tools (e.g. a worker that only inspects and migrates)
+TELEGRAM_EXPOSED_TOOLS=read-only,migration
 ```
 
 This is an MCP tool-surface restriction, not a Telegram session sandbox or
 reduced Telegram account permission. The Telegram session string still has its
-normal authority inside the server process; read-only mode only prevents
-non-read-only tools from being registered and exposed through MCP. Accepted
-values are `all` (the default) and `read-only`.
+normal authority inside the server process; a restricted tier only prevents
+tools outside the selected tiers from being registered and exposed through MCP.
 
 Run the server locally:
 
@@ -494,6 +506,8 @@ uv run flake8 .
 - By default, Telegram API calls go directly from your machine/container to Telegram.
   If `TELEGRAM_PROXY_*` is configured, Telegram traffic is routed through the
   configured SOCKS/HTTP/MTProxy proxy instead.
+- Session files must stay `600`. The server warns at startup when a file-based
+  session is group/world readable.
 - User-generated Telegram content is sanitized before being returned to MCP clients.
 
 ### Prompt Injection Protection
@@ -505,6 +519,62 @@ Telegram messages, display names, chat titles, and button labels are untrusted c
 - MCP content annotations marking returned content as user audience data.
 - Tool descriptions that warn clients not to treat returned Telegram fields as model instructions.
 - No brittle keyword-based filtering.
+
+## Audit Logging and Transient Retry
+
+### Audit logging
+
+Every tool call can be traced by appending JSON lines (one per call) to a file.
+Disabled by default; enable with:
+
+```env
+TELEGRAM_AUDIT_LOG=/var/log/telegram-mcp/audit.jsonl
+```
+
+Each line contains a UTC timestamp, tool name, account label, and outcome
+(`ok`, or the exception class name on failure). Argument **values are never
+logged** — set `TELEGRAM_AUDIT_LOG_ARGS=1` to also record parameter *names*.
+Audit write failures are swallowed (logged as a warning) so they can never
+break a tool call.
+
+### Transient retry
+
+A connection reset or timeout mid-request is ambiguous: the operation may
+already have reached Telegram, and blindly retrying a send-type tool could
+duplicate messages. Telethon already handles FloodWait and transport-level
+retries internally, so a central retry is **opt-in**:
+
+```env
+# Retry transient connection errors up to 2 times (backoff 1s, 2s, ... capped 10s).
+TELEGRAM_RETRY_TRANSIENT=2
+```
+
+Default is `0` (disabled). Only `ConnectionError`/`TimeoutError` are eligible;
+server-side RPC errors are never retried.
+
+### Result size cap
+
+Oversized tool results bloat the LLM context window (and cost). Results
+larger than 150,000 characters always log a server-side warning. To enforce a
+hard cap, set:
+
+```env
+TELEGRAM_MAX_RESULT_CHARS=100000
+```
+
+Oversized results are then truncated with a visible
+`…[truncated by TELEGRAM_MAX_RESULT_CHARS]` marker. Without the variable,
+results are left intact (so structured JSON stays valid).
+
+### Session file permissions
+
+At startup the server warns when a file-based session is readable by
+group/others (`chmod 644` etc.). A session file is the account's credential —
+keep it `600`:
+
+```bash
+chmod 600 myaccount.session
+```
 
 ## Troubleshooting
 
