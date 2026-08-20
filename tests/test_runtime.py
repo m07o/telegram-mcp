@@ -46,7 +46,118 @@ def _synthetic_mcp():
 def test_get_exposed_tools_mode_defaults_to_all(monkeypatch):
     monkeypatch.delenv("TELEGRAM_EXPOSED_TOOLS", raising=False)
 
-    assert runtime._get_exposed_tools_mode() == "all"
+    assert runtime._get_exposed_tools_mode() == ["all"]
+
+
+def test_get_exposed_tools_mode_accepts_comma_separated_list():
+    assert runtime._get_exposed_tools_mode("read-only, write") == ["read-only", "write"]
+    assert runtime._get_exposed_tools_mode("read-only,read-only") == ["read-only"]
+    assert runtime._get_exposed_tools_mode("  ") == ["all"]
+
+
+def test_get_exposed_tools_mode_rejects_invalid_tier_in_list():
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._get_exposed_tools_mode("read-only,bogus")
+
+    message = str(excinfo.value)
+    assert "TELEGRAM_EXPOSED_TOOLS" in message
+    for tier in ("all", "read-only", "write", "admin", "migration"):
+        assert tier in message
+
+
+def test_tool_tier_classification():
+    server = _synthetic_mcp()
+    tools = {tool.name: tool for tool in server._tool_manager.list_tools()}
+
+    assert runtime._tool_tier(tools["read_tool"]) == "read-only"
+    assert runtime._tool_tier(tools["write_tool"]) == "write"
+
+    # Admin classification is by explicit tool name.
+    admin_tool = tools["write_tool"].model_copy(update={"name": "ban_user"})
+    assert runtime._tool_tier(admin_tool) == "admin"
+
+    # Migration classification is by defining module.
+    migration_tool = tools["write_tool"].model_copy(
+        update={
+            "name": "some_migration_write",
+            "fn": SimpleNamespace(__module__="telegram_mcp.tools.migration"),
+        }
+    )
+    assert runtime._tool_tier(migration_tool) == "migration"
+
+    # Read-only wins over module location (least privilege first).
+    readonly_migration = tools["read_tool"].model_copy(
+        update={
+            "name": "get_migration_state",
+            "fn": SimpleNamespace(__module__="telegram_mcp.tools.migration"),
+        }
+    )
+    assert runtime._tool_tier(readonly_migration) == "read-only"
+
+
+def test_apply_exposed_tools_admin_keeps_only_admin_tier():
+    server = FastMCP("test")
+
+    @server.tool(annotations=ToolAnnotations(title="Read", readOnlyHint=True))
+    def read_tool():
+        return "read"
+
+    @server.tool(annotations=ToolAnnotations(title="Write"))
+    def write_tool():
+        return "write"
+
+    @server.tool(annotations=ToolAnnotations(title="Ban", destructiveHint=True))
+    def ban_user():
+        return "banned"
+
+    removed = runtime._apply_exposed_tools_mode(server, "admin")
+
+    assert set(_tool_names(server)) == {"ban_user"}
+    assert sorted(removed) == ["read_tool", "write_tool"]
+
+
+def test_apply_exposed_tools_migration_removes_other_modules():
+    server = FastMCP("test")
+
+    @server.tool(annotations=ToolAnnotations(title="Write"))
+    def plain_write_tool():
+        return "w"
+
+    @server.tool(annotations=ToolAnnotations(title="Migrate"))
+    def migrate_tool():
+        return "m"
+
+    server._tool_manager._tools["migrate_tool"] = server._tool_manager._tools[
+        "migrate_tool"
+    ].model_copy(
+        update={"fn": SimpleNamespace(__module__="telegram_mcp.tools.migration")}
+    )
+
+    removed = runtime._apply_exposed_tools_mode(server, "migration")
+
+    assert set(_tool_names(server)) == {"migrate_tool"}
+    assert removed == ["plain_write_tool"]
+
+
+def test_apply_exposed_tools_union_of_tiers():
+    server = FastMCP("test")
+
+    @server.tool(annotations=ToolAnnotations(title="Read", readOnlyHint=True))
+    def read_tool():
+        return "read"
+
+    @server.tool(annotations=ToolAnnotations(title="Write"))
+    def write_tool():
+        return "write"
+
+    @server.tool(annotations=ToolAnnotations(title="Ban", destructiveHint=True))
+    def ban_user():
+        return "banned"
+
+    removed = runtime._apply_exposed_tools_mode(server, "read-only,admin")
+
+    assert set(_tool_names(server)) == {"read_tool", "ban_user"}
+    assert removed == ["write_tool"]
 
 
 def test_apply_exposed_tools_all_keeps_tools():

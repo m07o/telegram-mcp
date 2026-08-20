@@ -140,35 +140,97 @@ def _install_annotation_hook() -> None:
 _install_annotation_hook()
 
 
-_EXPOSED_TOOLS_MODES = {"all", "read-only"}
+_EXPOSED_TOOLS_MODES = {"all", "read-only", "write", "admin", "migration"}
+
+# Admin-tier tools: group administration operations with elevated impact.
+# Kept as an explicit, auditable list (not annotation-based) so the exact
+# tools a "admin" deployment can call are always visible here.
+ADMIN_TOOLS: frozenset = frozenset(
+    {
+        "promote_admin",
+        "demote_admin",
+        "edit_admin_rights",
+        "ban_user",
+        "unban_user",
+        "ban_users_bulk",
+        "unban_users_bulk",
+        "set_default_chat_permissions",
+        "toggle_slow_mode",
+    }
+)
 
 
-def _get_exposed_tools_mode(value: Optional[str] = None) -> str:
-    """Return the configured MCP tool exposure mode.
+def _get_exposed_tools_mode(value: Optional[str] = None) -> list[str]:
+    """Return the configured MCP tool exposure tiers, validated.
 
-    ``TELEGRAM_EXPOSED_TOOLS=read-only`` keeps only tools annotated with
-    ``readOnlyHint=True``. The default is ``all`` for backward compatibility.
+    ``TELEGRAM_EXPOSED_TOOLS`` accepts a single tier or a comma-separated
+    list, e.g. ``read-only,write``. Tiers:
+
+    - ``all``: every registered tool (default, backward compatible).
+    - ``read-only``: tools annotated ``readOnlyHint=True``.
+    - ``write``: all other non-read-only tools.
+    - ``admin``: elevated group-administration tools (see ``ADMIN_TOOLS``).
+    - ``migration``: tools defined in ``telegram_mcp.tools.migration``.
+
+    Multiple tiers are combined by union. Unknown values fail fast at
+    startup with ``SystemExit``.
     """
     raw_value = os.getenv("TELEGRAM_EXPOSED_TOOLS", "all") if value is None else value
-    mode = raw_value.strip().lower()
-    if mode not in _EXPOSED_TOOLS_MODES:
+    tiers = [part.strip().lower() for part in raw_value.split(",") if part.strip()]
+    if not tiers:
+        tiers = ["all"]
+    invalid = [tier for tier in tiers if tier not in _EXPOSED_TOOLS_MODES]
+    if invalid:
         accepted = ", ".join(sorted(_EXPOSED_TOOLS_MODES))
         raise SystemExit(
-            f"Invalid TELEGRAM_EXPOSED_TOOLS '{raw_value}'. Expected one of: {accepted}."
+            f"Invalid TELEGRAM_EXPOSED_TOOLS '{raw_value}'. "
+            f"Expected one of (or a comma-separated list of): {accepted}."
         )
-    return mode
+    # De-duplicate while preserving order.
+    seen = set()
+    ordered = []
+    for tier in tiers:
+        if tier not in seen:
+            seen.add(tier)
+            ordered.append(tier)
+    return ordered
+
+
+def _tool_tier(tool) -> str:
+    """Classify a registered tool into exactly one exposure tier.
+
+    Classification is least-privilege first: a read-only tool is always
+    ``read-only`` even if defined in the migration module, and an admin
+    tool is never ``write``.
+    """
+    annotations = getattr(tool, "annotations", None)
+    if getattr(annotations, "readOnlyHint", False):
+        return "read-only"
+    if tool.name in ADMIN_TOOLS:
+        return "admin"
+    fn = getattr(tool, "fn", None)
+    module = getattr(fn, "__module__", "") or ""
+    if module == "telegram_mcp.tools.migration":
+        return "migration"
+    return "write"
 
 
 def _apply_exposed_tools_mode(server: FastMCP = mcp, mode: Optional[str] = None) -> list[str]:
-    """Prune registered MCP tools according to the configured exposure mode."""
-    selected_mode = _get_exposed_tools_mode() if mode is None else _get_exposed_tools_mode(mode)
-    if selected_mode == "all":
+    """Prune registered MCP tools according to the configured exposure tiers.
+
+    A tool is kept when its tier (see ``_tool_tier``) is among the selected
+    tiers, or when ``all`` is selected. Returns the names of removed tools.
+    """
+    selected_tiers = (
+        _get_exposed_tools_mode() if mode is None else _get_exposed_tools_mode(mode)
+    )
+    if "all" in selected_tiers:
         return []
 
+    allowed = set(selected_tiers)
     removed: list[str] = []
     for tool in list(server._tool_manager.list_tools()):
-        annotations = getattr(tool, "annotations", None)
-        if not getattr(annotations, "readOnlyHint", False):
+        if _tool_tier(tool) not in allowed:
             server._tool_manager.remove_tool(tool.name)
             removed.append(tool.name)
     return removed
