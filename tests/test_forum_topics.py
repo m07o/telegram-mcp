@@ -116,3 +116,69 @@ async def test_create_forum_topic_requires_forum_enabled(monkeypatch):
         == "The specified supergroup does not have forum topics enabled. Use enable_forum_topics first."
     )
     assert client.requests == []
+
+
+class _FakeTopic:
+    def __init__(self, i):
+        self.id = i
+        self.title = f"Topic {i}"
+        self.total_messages = None
+        self.unread_count = 0
+        self.closed = False
+        self.hidden = False
+        self.top_message = None
+
+
+def _setup_list_topics(monkeypatch, fake_topics):
+    entity = _supergroup(forum=True)
+    client = RecordingClient(
+        result=SimpleNamespace(topics=fake_topics, messages=[])
+    )
+
+    async def fake_resolve(chat_id, cl):
+        return entity
+
+    monkeypatch.setattr(chats, "get_client", lambda account=None: client)
+    monkeypatch.setattr(chats, "resolve_entity", fake_resolve)
+    return entity
+
+
+@pytest.mark.asyncio
+async def test_list_topics_full_page_warns_more_topics_exist(monkeypatch):
+    # Exactly 100 topics = a full Telegram page -> result must warn.
+    _setup_list_topics(monkeypatch, [_FakeTopic(i) for i in range(1, 101)])
+
+    out = json.loads(await chats.list_topics(chat_id=12345))
+
+    assert "warning" in out
+    assert "fetch_all=True" in out["warning"]
+    assert len(out["results"]) == 100
+
+
+@pytest.mark.asyncio
+async def test_list_topics_partial_page_has_no_warning(monkeypatch):
+    _setup_list_topics(monkeypatch, [_FakeTopic(i) for i in range(1, 51)])
+
+    out = json.loads(await chats.list_topics(chat_id=12345))
+
+    assert "warning" not in out
+    assert len(out["results"]) == 50
+
+
+@pytest.mark.asyncio
+async def test_list_topics_fetch_all_reports_total(monkeypatch):
+    _setup_list_topics(monkeypatch, [])
+
+    async def fake_iter(cl, entity, page_size=100):
+        for i in range(1, 251):
+            yield _FakeTopic(i)
+
+    monkeypatch.setattr(
+        "telegram_mcp.forum_pagination.iter_forum_topics", fake_iter
+    )
+
+    out = json.loads(await chats.list_topics(chat_id=12345, fetch_all=True))
+
+    assert out["total_topics"] == 250
+    assert len(out["results"]) == 250
+    assert "warning" not in out

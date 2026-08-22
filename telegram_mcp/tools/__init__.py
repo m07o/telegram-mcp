@@ -9,5 +9,11 @@ from telegram_mcp.tools.media import *
 from telegram_mcp.tools.profile import *
 from telegram_mcp.tools.folders import *
 from telegram_mcp.tools.events import *
+from telegram_mcp.tools.forum_forward import *
+from telegram_mcp.tools.content import *
+from telegram_mcp.tools.migration import *
+from telegram_mcp.tools.database import *
+from telegram_mcp.tools.discovery import *
+from telegram_mcp.tools.diagnostics import *
 
 __all__ = [name for name in globals() if not name.startswith("_")]

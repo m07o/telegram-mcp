@@ -1028,6 +1028,188 @@ async def forward_messages(
 
 @mcp.tool(
     annotations=ToolAnnotations(
+        title="Copy Message (No Forward Tag)", openWorldHint=True, destructiveHint=True
+    )
+)
+@with_account(readonly=False)
+@validate_id("from_chat_id", "to_chat_id")
+async def copy_message(
+    from_chat_id: Union[int, str],
+    message_id: int,
+    to_chat_id: Union[int, str],
+    reply_to: Optional[int] = None,
+    account: str = None,
+) -> str:
+    """
+    Copy a single message from source to destination WITHOUT "Forwarded from" tag.
+    Uses server-side copy (send_file with msg.media) — no download, no forward tag.
+    Works with any file size (even multi-GB videos) in under a second.
+
+    Args:
+        from_chat_id: Source chat (id or @username).
+        message_id: The message ID to copy.
+        to_chat_id: Destination chat (id or @username).
+        reply_to: Optional topic/thread ID to reply to (for forum topics).
+        account: Optional account label for multi-account mode.
+    """
+    try:
+        cl = get_client(account)
+        from_entity = await resolve_entity(from_chat_id, cl)
+        to_entity = await resolve_entity(to_chat_id, cl)
+
+        msg = await cl.get_messages(from_entity, ids=message_id)
+        if isinstance(msg, list):
+            msg = msg[0] if msg else None
+        if not msg:
+            return f"Message {message_id} not found in {from_chat_id}."
+
+        if getattr(msg, "action", None):
+            return f"Message {message_id} is a service message, skipping."
+
+        raw_text = getattr(msg, "message", None) or ""
+        if raw_text.strip() in {".", "===", "/", "@", ""} and not getattr(msg, "media", None):
+            return f"Message {message_id} is noise, skipping."
+
+        send_kwargs = {}
+        if reply_to is not None:
+            send_kwargs["reply_to"] = reply_to
+
+        if getattr(msg, "media", None):
+            send_kwargs["file"] = msg.media
+            if raw_text:
+                send_kwargs["caption"] = raw_text
+                entities = getattr(msg, "entities", None)
+                if entities:
+                    send_kwargs["formatting_entities"] = entities
+            if hasattr(msg, "video") and msg.video:
+                send_kwargs["supports_streaming"] = True
+            await cl.send_file(to_entity, **send_kwargs)
+        elif raw_text:
+            entities = getattr(msg, "entities", None)
+            if entities:
+                send_kwargs["formatting_entities"] = entities
+            await cl.send_message(to_entity, raw_text, **send_kwargs)
+        else:
+            return f"Message {message_id} is empty, skipping."
+
+        return f"Message {message_id} copied from {from_chat_id} to {to_chat_id} (no forward tag)."
+    except Exception as e:
+        return log_and_format_error(
+            "copy_message",
+            e,
+            from_chat_id=from_chat_id,
+            message_id=message_id,
+            to_chat_id=to_chat_id,
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Copy Messages Batch (No Forward Tag)", openWorldHint=True, destructiveHint=True
+    )
+)
+@with_account(readonly=False)
+@validate_id("from_chat_id", "to_chat_id")
+async def copy_messages(
+    from_chat_id: Union[int, str],
+    message_ids: List[int],
+    to_chat_id: Union[int, str],
+    reply_to: Optional[int] = None,
+    delay: float = 0.5,
+    account: str = None,
+) -> str:
+    """
+    Copy multiple messages from source to destination WITHOUT "Forwarded from" tag.
+    Uses server-side copy for each message. Preserves media, captions, and formatting.
+
+    Args:
+        from_chat_id: Source chat (id or @username).
+        message_ids: List of message IDs to copy.
+        to_chat_id: Destination chat (id or @username).
+        reply_to: Optional topic/thread ID (for forum topics).
+        delay: Delay between copies in seconds (default 0.5 to avoid flood).
+        account: Optional account label for multi-account mode.
+    """
+    try:
+        if not message_ids:
+            return "Error: message_ids must contain at least one id."
+        cl = get_client(account)
+        from_entity = await resolve_entity(from_chat_id, cl)
+        to_entity = await resolve_entity(to_chat_id, cl)
+
+        import asyncio as _asyncio
+
+        SKIP_PATTERNS = {".", "===", "/", "@"}
+        copied = 0
+        failed = 0
+        skipped = 0
+        errors = []
+
+        for mid in message_ids:
+            try:
+                msg = await cl.get_messages(from_entity, ids=mid)
+                if isinstance(msg, list):
+                    msg = msg[0] if msg else None
+                if not msg:
+                    failed += 1
+                    continue
+
+                if getattr(msg, "action", None):
+                    skipped += 1
+                    continue
+
+                raw_text = getattr(msg, "message", None) or ""
+                if raw_text.strip() in SKIP_PATTERNS and not getattr(msg, "media", None):
+                    skipped += 1
+                    continue
+
+                send_kwargs = {}
+                if reply_to is not None:
+                    send_kwargs["reply_to"] = reply_to
+
+                if getattr(msg, "media", None):
+                    send_kwargs["file"] = msg.media
+                    if raw_text:
+                        send_kwargs["caption"] = raw_text
+                        entities = getattr(msg, "entities", None)
+                        if entities:
+                            send_kwargs["formatting_entities"] = entities
+                    if hasattr(msg, "video") and msg.video:
+                        send_kwargs["supports_streaming"] = True
+                    await cl.send_file(to_entity, **send_kwargs)
+                elif raw_text:
+                    entities = getattr(msg, "entities", None)
+                    if entities:
+                        send_kwargs["formatting_entities"] = entities
+                    await cl.send_message(to_entity, raw_text, **send_kwargs)
+                else:
+                    skipped += 1
+                    continue
+
+                copied += 1
+                await _asyncio.sleep(delay)
+            except Exception as e:
+                failed += 1
+                if len(errors) < 5:
+                    errors.append(f"msg {mid}: {str(e)[:100]}")
+                await _asyncio.sleep(1)
+
+        result = f"Copied: {copied}, Failed: {failed}, Skipped: {skipped}"
+        if errors:
+            result += f"\nErrors: {'; '.join(errors)}"
+        return result
+    except Exception as e:
+        return log_and_format_error(
+            "copy_messages",
+            e,
+            from_chat_id=from_chat_id,
+            message_ids=message_ids,
+            to_chat_id=to_chat_id,
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
         title="Edit Message", openWorldHint=True, destructiveHint=True, idempotentHint=True
     )
 )
@@ -1831,6 +2013,8 @@ __all__ = [
     "list_messages",
     "get_message_context",
     "forward_message",
+    "copy_message",
+    "copy_messages",
     "edit_message",
     "delete_message",
     "delete_chat_history",

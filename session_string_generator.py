@@ -20,20 +20,34 @@ parameters support integer IDs, string representations of IDs (e.g., "123456"),
 and usernames (e.g., "@mychannel").
 """
 
+from __future__ import annotations
+
 import argparse
 import asyncio
+import datetime as _dt
 import getpass
 import io
 import os
 import sys
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
+from typing import TypeAlias
 
 from dotenv import load_dotenv
 from telethon import errors
+from telethon import custom
 from telethon.sessions import StringSession
 from telethon.sync import TelegramClient
 from telegram_mcp.client_identity import client_identity_kwargs
 from telegram_mcp.install_guard import UnsafeInstallationError, assert_safe_distribution
+
+if TYPE_CHECKING:
+    from telethon.client.telegrambaseclient import TelegramClient  # noqa: F401
+
+# Type alias for the QR login helper class returned by ``TelegramClient.qr_login()``.
+# Using ``TypeAlias`` (rather than a bare assignment) makes the symbol valid as an
+# annotation target for mypy.
+QRLogin: TypeAlias = custom.QRLogin
 
 # How many times the QR code is regenerated after expiry before giving up.
 _QR_MAX_REFRESHES = 10
@@ -60,6 +74,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _check_installation() -> None:
+    """Fail fast with a clear message if the installed distribution is unsuitable."""
     try:
         assert_safe_distribution()
     except UnsafeInstallationError as exc:
@@ -67,8 +82,9 @@ def _check_installation() -> None:
         sys.exit(1)
 
 
-def _render_qr(qr) -> None:
-    import qrcode
+def _render_qr(qr: QRLogin) -> None:
+    """Print the QR code to stdout in ASCII form, with scanning instructions."""
+    import qrcode  # type: ignore[import-untyped]
 
     print("\n----- QR Code Login -----\n")
 
@@ -86,9 +102,9 @@ def _render_qr(qr) -> None:
     print("Waiting for you to scan...")
 
 
-def _seconds_until_expiry(qr) -> float:
+def _seconds_until_expiry(qr: QRLogin) -> float:
     """Seconds left before this QR token expires, with a small safety margin."""
-    expires = qr.expires
+    expires: _dt.datetime = qr.expires
     if expires.tzinfo is None:
         expires = expires.replace(tzinfo=timezone.utc)
     remaining = (expires - datetime.now(timezone.utc)).total_seconds()
@@ -96,7 +112,8 @@ def _seconds_until_expiry(qr) -> float:
 
 
 def _qr_login(client: TelegramClient) -> None:
-    qr = client.qr_login()
+    """Run the interactive QR-code login flow, refreshing expired tokens."""
+    qr: QRLogin = client.qr_login()
     _render_qr(qr)
 
     for _ in range(_QR_MAX_REFRESHES):
@@ -108,7 +125,7 @@ def _qr_login(client: TelegramClient) -> None:
             print("\nQR code expired, here is a fresh one.")
             _render_qr(qr)
         except errors.SessionPasswordNeededError:
-            pw = getpass.getpass(
+            pw: str = getpass.getpass(
                 "\nTwo-factor authentication enabled. Please enter your password: "
             )
             client.sign_in(password=pw)
@@ -120,7 +137,8 @@ def _qr_login(client: TelegramClient) -> None:
 
 
 def _phone_login(client: TelegramClient) -> None:
-    phone = input("Please enter your phone (or bot token): ")
+    """Run the interactive phone-number login flow, prompting for phone + code."""
+    phone: str = input("Please enter your phone (or bot token): ")
 
     try:
         client.send_code_request(phone)
@@ -137,7 +155,7 @@ def _phone_login(client: TelegramClient) -> None:
         client.disconnect()
         sys.exit(1)
 
-    code = input("\nPlease enter the code you received: ")
+    code: str = input("\nPlease enter the code you received: ")
     try:
         client.sign_in(phone, code)
     except errors.SessionPasswordNeededError:
@@ -146,11 +164,12 @@ def _phone_login(client: TelegramClient) -> None:
 
 
 def main() -> None:
-    args = _parse_args()
+    """Entry point: drive the interactive login flow and persist the session string."""
+    args: argparse.Namespace = _parse_args()
     _check_installation()
 
-    API_ID = os.getenv("TELEGRAM_API_ID")
-    API_HASH = os.getenv("TELEGRAM_API_HASH")
+    API_ID: str | None = os.getenv("TELEGRAM_API_ID")
+    API_HASH: str | None = os.getenv("TELEGRAM_API_HASH")
 
     if not API_ID or not API_HASH:
         print("Error: TELEGRAM_API_ID and TELEGRAM_API_HASH must be set in .env file")
@@ -158,7 +177,7 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        API_ID = int(API_ID)
+        API_ID_INT: int = int(API_ID)
     except ValueError:
         print("Error: TELEGRAM_API_ID must be an integer")
         sys.exit(1)
@@ -170,14 +189,14 @@ def main() -> None:
         "\nYour credentials will NOT be stored on any server and are only used for local authentication.\n"
     )
 
-    label = (
+    label: str = (
         input("Account label (optional, e.g. 'work', 'personal'; leave empty for default): ")
         .strip()
         .lower()
     )
 
     if args.qr:
-        method = "1"
+        method: str = "1"
     elif args.phone:
         method = "2"
     else:
@@ -187,7 +206,9 @@ def main() -> None:
         method = input("\nEnter 1 or 2 [default: 1]: ").strip() or "1"
 
     try:
-        client = TelegramClient(StringSession(), API_ID, API_HASH, **client_identity_kwargs())
+        client: TelegramClient = TelegramClient(
+            StringSession(), API_ID_INT, API_HASH, **client_identity_kwargs()
+        )
         client.connect()
 
         if not client.is_user_authorized():
@@ -196,10 +217,10 @@ def main() -> None:
             else:
                 _phone_login(client)
 
-        session_string = StringSession.save(client.session)
+        session_string: str = StringSession.save(client.session)
 
         if label:
-            env_var = f"TELEGRAM_SESSION_STRING_{label.upper()}"
+            env_var: str = f"TELEGRAM_SESSION_STRING_{label.upper()}"
         else:
             env_var = "TELEGRAM_SESSION_STRING"
 
@@ -210,15 +231,15 @@ def main() -> None:
         print(f"{env_var}={session_string}")
         print("\nIMPORTANT: Keep this string private and never share it with anyone!")
 
-        choice = input(
+        choice: str = input(
             "\nWould you like to automatically update your .env file with this session string? (y/N): "
         )
         if choice.lower() == "y":
             try:
                 with open(".env", "r") as file:
-                    env_contents = file.readlines()
+                    env_contents: list[str] = file.readlines()
 
-                session_string_line_found = False
+                session_string_line_found: bool = False
                 for i, line in enumerate(env_contents):
                     if line.startswith(f"{env_var}="):
                         env_contents[i] = f"{env_var}={session_string}\n"

@@ -1,3 +1,5 @@
+import os
+
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,7 +48,118 @@ def _synthetic_mcp():
 def test_get_exposed_tools_mode_defaults_to_all(monkeypatch):
     monkeypatch.delenv("TELEGRAM_EXPOSED_TOOLS", raising=False)
 
-    assert runtime._get_exposed_tools_mode() == "all"
+    assert runtime._get_exposed_tools_mode() == ["all"]
+
+
+def test_get_exposed_tools_mode_accepts_comma_separated_list():
+    assert runtime._get_exposed_tools_mode("read-only, write") == ["read-only", "write"]
+    assert runtime._get_exposed_tools_mode("read-only,read-only") == ["read-only"]
+    assert runtime._get_exposed_tools_mode("  ") == ["all"]
+
+
+def test_get_exposed_tools_mode_rejects_invalid_tier_in_list():
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._get_exposed_tools_mode("read-only,bogus")
+
+    message = str(excinfo.value)
+    assert "TELEGRAM_EXPOSED_TOOLS" in message
+    for tier in ("all", "read-only", "write", "admin", "migration"):
+        assert tier in message
+
+
+def test_tool_tier_classification():
+    server = _synthetic_mcp()
+    tools = {tool.name: tool for tool in server._tool_manager.list_tools()}
+
+    assert runtime._tool_tier(tools["read_tool"]) == "read-only"
+    assert runtime._tool_tier(tools["write_tool"]) == "write"
+
+    # Admin classification is by explicit tool name.
+    admin_tool = tools["write_tool"].model_copy(update={"name": "ban_user"})
+    assert runtime._tool_tier(admin_tool) == "admin"
+
+    # Migration classification is by defining module.
+    migration_tool = tools["write_tool"].model_copy(
+        update={
+            "name": "some_migration_write",
+            "fn": SimpleNamespace(__module__="telegram_mcp.tools.migration"),
+        }
+    )
+    assert runtime._tool_tier(migration_tool) == "migration"
+
+    # Read-only wins over module location (least privilege first).
+    readonly_migration = tools["read_tool"].model_copy(
+        update={
+            "name": "get_migration_state",
+            "fn": SimpleNamespace(__module__="telegram_mcp.tools.migration"),
+        }
+    )
+    assert runtime._tool_tier(readonly_migration) == "read-only"
+
+
+def test_apply_exposed_tools_admin_keeps_only_admin_tier():
+    server = FastMCP("test")
+
+    @server.tool(annotations=ToolAnnotations(title="Read", readOnlyHint=True))
+    def read_tool():
+        return "read"
+
+    @server.tool(annotations=ToolAnnotations(title="Write"))
+    def write_tool():
+        return "write"
+
+    @server.tool(annotations=ToolAnnotations(title="Ban", destructiveHint=True))
+    def ban_user():
+        return "banned"
+
+    removed = runtime._apply_exposed_tools_mode(server, "admin")
+
+    assert set(_tool_names(server)) == {"ban_user"}
+    assert sorted(removed) == ["read_tool", "write_tool"]
+
+
+def test_apply_exposed_tools_migration_removes_other_modules():
+    server = FastMCP("test")
+
+    @server.tool(annotations=ToolAnnotations(title="Write"))
+    def plain_write_tool():
+        return "w"
+
+    @server.tool(annotations=ToolAnnotations(title="Migrate"))
+    def migrate_tool():
+        return "m"
+
+    server._tool_manager._tools["migrate_tool"] = server._tool_manager._tools[
+        "migrate_tool"
+    ].model_copy(
+        update={"fn": SimpleNamespace(__module__="telegram_mcp.tools.migration")}
+    )
+
+    removed = runtime._apply_exposed_tools_mode(server, "migration")
+
+    assert set(_tool_names(server)) == {"migrate_tool"}
+    assert removed == ["plain_write_tool"]
+
+
+def test_apply_exposed_tools_union_of_tiers():
+    server = FastMCP("test")
+
+    @server.tool(annotations=ToolAnnotations(title="Read", readOnlyHint=True))
+    def read_tool():
+        return "read"
+
+    @server.tool(annotations=ToolAnnotations(title="Write"))
+    def write_tool():
+        return "write"
+
+    @server.tool(annotations=ToolAnnotations(title="Ban", destructiveHint=True))
+    def ban_user():
+        return "banned"
+
+    removed = runtime._apply_exposed_tools_mode(server, "read-only,admin")
+
+    assert set(_tool_names(server)) == {"read_tool", "ban_user"}
+    assert removed == ["write_tool"]
 
 
 def test_apply_exposed_tools_all_keeps_tools():
@@ -802,3 +915,106 @@ async def test_empty_client_roots_fallback_noop_without_server_roots(monkeypatch
     roots, status = await runtime._get_effective_allowed_roots_with_status(_ctx_with_roots([]))
     assert roots == []
     assert status == runtime.ROOTS_STATUS_CLIENT_DENY_ALL
+
+
+# ---------------------------------------------------------------------------
+# Startup validation, stable error codes, result-size policy, session perms
+# ---------------------------------------------------------------------------
+
+
+def test_require_env_int_parses_valid_value(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_API_ID", "12345")
+
+    assert runtime._require_env_int("TELEGRAM_API_ID") == 12345
+
+
+def test_require_env_int_rejects_missing_and_non_integer(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_API_ID", raising=False)
+
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._require_env_int("TELEGRAM_API_ID")
+    assert "TELEGRAM_API_ID" in str(excinfo.value)
+    assert "my.telegram.org" in str(excinfo.value)
+
+    monkeypatch.setenv("TELEGRAM_API_ID", "not-a-number")
+    with pytest.raises(SystemExit):
+        runtime._require_env_int("TELEGRAM_API_ID")
+
+
+def test_error_code_is_stable_across_calls():
+    import re
+
+    first = runtime.log_and_format_error("list_chats", RuntimeError("x"))
+    second = runtime.log_and_format_error("list_chats", RuntimeError("y"))
+
+    code1 = re.search(r"code: ([A-Z]+-ERR-\d{3})", first).group(1)
+    code2 = re.search(r"code: ([A-Z]+-ERR-\d{3})", second).group(1)
+    # crc32-based: identical across calls (and across processes/restarts).
+    assert code1 == code2
+
+
+def test_get_max_result_chars(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_MAX_RESULT_CHARS", raising=False)
+    assert runtime._get_max_result_chars() is None
+
+    monkeypatch.setenv("TELEGRAM_MAX_RESULT_CHARS", "1000")
+    assert runtime._get_max_result_chars() == 1000
+
+    monkeypatch.setenv("TELEGRAM_MAX_RESULT_CHARS", "bogus")
+    assert runtime._get_max_result_chars() is None
+
+    monkeypatch.setenv("TELEGRAM_MAX_RESULT_CHARS", "0")
+    assert runtime._get_max_result_chars() is None
+
+
+def test_result_size_policy_truncates_when_capped(monkeypatch):
+    from mcp.types import TextContent
+
+    big = TextContent(type="text", text="x" * 5000)
+    small = TextContent(type="text", text="ok")
+    monkeypatch.setenv("TELEGRAM_MAX_RESULT_CHARS", "100")
+
+    out = runtime._apply_result_size_policy([big, small], "big_tool")
+
+    assert len(out[0].text) == 100 + len(runtime._RESULT_TRUNCATION_MARKER)
+    assert out[0].text.endswith("TELEGRAM_MAX_RESULT_CHARS]")
+    assert out[1].text == "ok"  # under cap: untouched
+
+
+def test_result_size_policy_untouched_without_cap():
+    from mcp.types import TextContent
+
+    big = TextContent(type="text", text="y" * (runtime._RESULT_WARN_CHARS + 1))
+
+    out = runtime._apply_result_size_policy([big], "big_tool")
+
+    assert out[0].text == "y" * (runtime._RESULT_WARN_CHARS + 1)
+
+
+@pytest.mark.skipif(os.name == "nt",
+                    reason="Windows chmod does not affect stat modes; POSIX-only check")
+def test_world_readable_session_warns(tmp_path, monkeypatch, caplog):
+    import logging
+
+    session_path = tmp_path / "secret.session"
+    session_path.write_text("session-data")
+    session_path.chmod(0o644)
+
+    class FakeSession:
+        session_file = str(session_path)
+
+    class FakeClient:
+        session = FakeSession()
+
+    monkeypatch.setattr(runtime, "clients", {"default": FakeClient()})
+
+    with caplog.at_level(logging.WARNING, logger="telegram_mcp"):
+        runtime._warn_world_readable_sessions()
+    assert any("readable by group/others" in r.message for r in caplog.records)
+
+    # 0600 is fine: no warning.
+    session_path.chmod(0o600)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="telegram_mcp"):
+        runtime._warn_world_readable_sessions()
+    assert not any("readable by group/others" in r.message for r in caplog.records)

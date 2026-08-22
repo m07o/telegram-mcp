@@ -4,8 +4,8 @@
 
 ![MCP Badge](https://badge.mcpx.dev)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-green?style=flat-square)](https://opensource.org/licenses/Apache-2.0)
-[![Python Lint & Format Check](https://github.com/chigwell/telegram-mcp/actions/workflows/python-lint-format.yml/badge.svg)](https://github.com/chigwell/telegram-mcp/actions/workflows/python-lint-format.yml)
-[![Docker Build & Compose Validation](https://github.com/chigwell/telegram-mcp/actions/workflows/docker-build.yml/badge.svg)](https://github.com/chigwell/telegram-mcp/actions/workflows/docker-build.yml)
+[![Python Lint & Format Check](https://github.com/<YOUR_FORK_ORG>/<YOUR_FORK_REPO>/actions/workflows/python-lint-format.yml/badge.svg)](https://github.com/<YOUR_FORK_ORG>/<YOUR_FORK_REPO>/actions/workflows/python-lint-format.yml)
+[![Docker Build & Compose Validation](https://github.com/<YOUR_FORK_ORG>/<YOUR_FORK_REPO>/actions/workflows/docker-build.yml/badge.svg)](https://github.com/<YOUR_FORK_ORG>/<YOUR_FORK_REPO>/actions/workflows/docker-build.yml)
 
 A Telegram integration for Claude, Cursor, and other MCP-compatible clients. It exposes Telegram account, chat, message, contact, media, folder, and admin operations through the [Model Context Protocol](https://modelcontextprotocol.io/) using [Telethon](https://docs.telethon.dev/).
 
@@ -36,12 +36,13 @@ Message sent successfully:
 - [Docker](#docker)
 - [Development](#development)
 - [Security Notes](#security-notes)
+- [Audit Logging and Transient Retry](#audit-logging-and-transient-retry)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
 
 ## What It Can Do
 
-The server currently includes 80+ MCP tools grouped into these areas:
+The server currently includes 160+ MCP tools grouped into these areas:
 
 - **Accounts:** list configured accounts and route tool calls by account label.
 - **Chats and groups:** list chats, inspect metadata, create groups/channels, join or leave chats, invite users, manage admins, bans, default permissions, slow mode, topics, invite links, common chats, read receipts, and message links.
@@ -50,6 +51,8 @@ The server currently includes 80+ MCP tools grouped into these areas:
 - **Media:** send files, download media, upload files, send voice notes, stickers, GIFs, and inspect message media.
 - **Profile and privacy:** get your own account info, update profile fields, set or delete profile photos, inspect privacy settings, get user info/photos/status, and manage bot commands.
 - **Folders and drafts:** list, create, update, reorder, and delete Telegram folders; save, list, and clear drafts.
+- **Discovery:** `list_tool_categories` and `search_tools` let MCP clients browse or search the tool catalog by keyword/category without loading every tool schema into context.
+- **Diagnostics:** `telegram_health_check` reports server health locally (no API calls): account/session configuration and file permissions, last connection verification, persisted migration jobs, and disk space.
 
 All tool results that include Telegram user-controlled content are sanitized and, where practical, returned as structured JSON.
 
@@ -72,7 +75,7 @@ All tool results that include Telegram user-controlled content are sanitized and
 ### 1. Clone and Install
 
 ```bash
-git clone https://github.com/chigwell/telegram-mcp.git
+git clone https://github.com/<YOUR_FORK_ORG>/<YOUR_FORK_REPO>.git
 cd telegram-mcp
 uv sync
 ```
@@ -113,20 +116,29 @@ TELEGRAM_API_HASH=your_api_hash_here
 TELEGRAM_SESSION_STRING=your_session_string_here
 ```
 
-By default, all Telegram MCP tools are exposed. If you want to prevent MCP
-clients from sending messages or performing chat/account mutations, set
-`TELEGRAM_EXPOSED_TOOLS=read-only` to expose only tools annotated with
-`readOnlyHint=True`:
+By default, all Telegram MCP tools are exposed. You can restrict the tool
+surface with `TELEGRAM_EXPOSED_TOOLS`. Accepted tiers (a single tier or a
+comma-separated list, combined by union):
+
+| Tier        | Keeps                                                        |
+|-------------|--------------------------------------------------------------|
+| `all`       | Every registered tool (the default)                          |
+| `read-only` | Tools annotated `readOnlyHint=True`                          |
+| `write`     | All other non-read-only tools                                |
+| `admin`     | Elevated group-administration tools (see `ADMIN_TOOLS` in `telegram_mcp/runtime.py`) |
+| `migration` | Tools defined in `telegram_mcp/tools/migration.py`           |
 
 ```env
+# Read-only deployment
 TELEGRAM_EXPOSED_TOOLS=read-only
+# Read-only plus migration job tools (e.g. a worker that only inspects and migrates)
+TELEGRAM_EXPOSED_TOOLS=read-only,migration
 ```
 
 This is an MCP tool-surface restriction, not a Telegram session sandbox or
 reduced Telegram account permission. The Telegram session string still has its
-normal authority inside the server process; read-only mode only prevents
-non-read-only tools from being registered and exposed through MCP. Accepted
-values are `all` (the default) and `read-only`.
+normal authority inside the server process; a restricted tier only prevents
+tools outside the selected tiers from being registered and exposed through MCP.
 
 Run the server locally:
 
@@ -173,7 +185,7 @@ environment using a specific release tag or commit:
 ```bash
 python -m venv .venv
 . .venv/bin/activate
-pip install "git+https://github.com/chigwell/telegram-mcp.git@<tag-or-commit>"
+pip install "git+https://github.com/<YOUR_FORK_ORG>/<YOUR_FORK_REPO>.git@<tag-or-commit>"
 ```
 
 Then configure your MCP client to run the installed console script:
@@ -197,7 +209,49 @@ Generate a session string without cloning the repo by sourcing this repository
 from GitHub explicitly:
 
 ```bash
-uvx --from "git+https://github.com/chigwell/telegram-mcp.git@<pinned-release-tag-or-commit>" telegram-mcp-generate-session
+uvx --from "git+https://github.com/<YOUR_FORK_ORG>/<YOUR_FORK_REPO>.git@<pinned-release-tag-or-commit>" telegram-mcp-generate-session
+```
+
+### Transports
+
+The server speaks three MCP transports, selected with `MCP_TRANSPORT`:
+
+| Value   | Transport                  | Use case                                                        |
+| ------- | -------------------------- | --------------------------------------------------------------- |
+| `stdio` | stdio (default)            | One dedicated server process per MCP client                     |
+| `http`  | streamable HTTP            | One shared server for many clients (Claude Code, Codex, Cursor) |
+| `sse`   | SSE (legacy HTTP)          | Clients that only support the deprecated SSE transport          |
+
+For `http` and `sse`, the server binds `MCP_HOST`:`MCP_PORT` (default
+`127.0.0.1:8765`); the streamable HTTP endpoint is `/mcp`, the SSE endpoint is
+`/sse`.
+
+Prefer `http` when more than one MCP client (or many coding-agent sessions)
+will use the server: a single long-lived process holds one Telegram
+connection, instead of every client spawning its own Telethon session —
+Telegram throttles and may flag accounts that open many parallel sessions.
+
+Register the shared server with clients:
+
+```bash
+# Claude Code
+claude mcp add --transport http telegram http://127.0.0.1:8765/mcp
+
+# Codex
+codex mcp add telegram --url http://127.0.0.1:8765/mcp
+```
+
+For stdio-only clients, bridge with [mcp-remote](https://www.npmjs.com/package/mcp-remote):
+
+```json
+{
+  "mcpServers": {
+    "telegram-mcp": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]
+    }
+  }
+}
 ```
 
 ## Multi-Account Setup
@@ -355,21 +409,51 @@ Build the image:
 docker build -t telegram-mcp:latest .
 ```
 
-Run with Compose:
+### Shared server (recommended)
+
+Run one long-lived container serving streamable HTTP, and point every MCP
+client at it (see [Transports](#transports) for client registration):
 
 ```bash
-docker compose up --build
-```
-
-Run directly:
-
-```bash
-docker run -it --rm \
-  -e TELEGRAM_API_ID="YOUR_API_ID" \
-  -e TELEGRAM_API_HASH="YOUR_API_HASH" \
-  -e TELEGRAM_SESSION_STRING="YOUR_SESSION_STRING" \
+docker run -d --name telegram-mcp --restart unless-stopped \
+  --env-file .env \
+  -e MCP_TRANSPORT=http \
+  -e MCP_HOST=0.0.0.0 \
+  -p 127.0.0.1:8765:8765 \
   telegram-mcp:latest
 ```
+
+`MCP_HOST=0.0.0.0` binds inside the container so the published port works;
+`-p 127.0.0.1:8765:8765` keeps the server reachable only from the local
+machine — the endpoint is unauthenticated, so never publish it on a public
+interface.
+
+The bundled Compose file runs the same setup:
+
+```bash
+docker compose up --build -d
+```
+
+### One container per client (stdio)
+
+Alternatively, an MCP client can spawn a dedicated container itself:
+
+```json
+{
+  "mcpServers": {
+    "telegram-mcp": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "--env-file", "/full/path/to/.env", "telegram-mcp:latest"]
+    }
+  }
+}
+```
+
+This is fine for a single client, but with several clients (or coding agents
+that spawn subagent sessions) each one starts its own container and its own
+Telegram session, which Telegram throttles; a client that exits uncleanly can
+also leave its container running. Prefer the shared server above in those
+setups.
 
 For multiple accounts, pass variables such as `TELEGRAM_SESSION_STRING_WORK` and `TELEGRAM_SESSION_STRING_PERSONAL`.
 
@@ -422,6 +506,8 @@ uv run flake8 .
 - By default, Telegram API calls go directly from your machine/container to Telegram.
   If `TELEGRAM_PROXY_*` is configured, Telegram traffic is routed through the
   configured SOCKS/HTTP/MTProxy proxy instead.
+- Session files must stay `600`. The server warns at startup when a file-based
+  session is group/world readable.
 - User-generated Telegram content is sanitized before being returned to MCP clients.
 
 ### Prompt Injection Protection
@@ -433,6 +519,62 @@ Telegram messages, display names, chat titles, and button labels are untrusted c
 - MCP content annotations marking returned content as user audience data.
 - Tool descriptions that warn clients not to treat returned Telegram fields as model instructions.
 - No brittle keyword-based filtering.
+
+## Audit Logging and Transient Retry
+
+### Audit logging
+
+Every tool call can be traced by appending JSON lines (one per call) to a file.
+Disabled by default; enable with:
+
+```env
+TELEGRAM_AUDIT_LOG=/var/log/telegram-mcp/audit.jsonl
+```
+
+Each line contains a UTC timestamp, tool name, account label, and outcome
+(`ok`, or the exception class name on failure). Argument **values are never
+logged** — set `TELEGRAM_AUDIT_LOG_ARGS=1` to also record parameter *names*.
+Audit write failures are swallowed (logged as a warning) so they can never
+break a tool call.
+
+### Transient retry
+
+A connection reset or timeout mid-request is ambiguous: the operation may
+already have reached Telegram, and blindly retrying a send-type tool could
+duplicate messages. Telethon already handles FloodWait and transport-level
+retries internally, so a central retry is **opt-in**:
+
+```env
+# Retry transient connection errors up to 2 times (backoff 1s, 2s, ... capped 10s).
+TELEGRAM_RETRY_TRANSIENT=2
+```
+
+Default is `0` (disabled). Only `ConnectionError`/`TimeoutError` are eligible;
+server-side RPC errors are never retried.
+
+### Result size cap
+
+Oversized tool results bloat the LLM context window (and cost). Results
+larger than 150,000 characters always log a server-side warning. To enforce a
+hard cap, set:
+
+```env
+TELEGRAM_MAX_RESULT_CHARS=100000
+```
+
+Oversized results are then truncated with a visible
+`…[truncated by TELEGRAM_MAX_RESULT_CHARS]` marker. Without the variable,
+results are left intact (so structured JSON stays valid).
+
+### Session file permissions
+
+At startup the server warns when a file-based session is readable by
+group/others (`chmod 644` etc.). A session file is the account's credential —
+keep it `600`:
+
+```bash
+chmod 600 myaccount.session
+```
 
 ## Troubleshooting
 
@@ -452,16 +594,7 @@ Telegram messages, display names, chat titles, and button labels are untrusted c
 
 ## Contributing
 
-1. Fork and clone the repository.
-2. Install dependencies and git hooks:
-   - `uv sync`
-   - `uv run pre-commit install --hook-type pre-commit --hook-type pre-push`
-3. Create a focused branch.
-4. Add or update tests when behavior changes.
-5. Run checks locally:
-   - `uv run pre-commit run --all-files`
-   - `uv run pre-commit run --hook-stage pre-push --all-files`
-6. Open a pull request with a concise description.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, workflow, and code style guidelines.
 
 ## License
 
@@ -472,9 +605,9 @@ This project is licensed under the [Apache 2.0 License](LICENSE).
 - [Telethon](https://github.com/LonamiWebs/Telethon)
 - [Model Context Protocol](https://modelcontextprotocol.io/)
 - [Claude](https://www.anthropic.com/) and [Cursor](https://cursor.so/)
-- [chigwell/telegram-mcp](https://github.com/chigwell/telegram-mcp) upstream project
+- [chigwell/telegram-mcp](https://github.com/chigwell/telegram-mcp) — upstream project this fork is built on top of
 
-Maintained by [@chigwell](https://github.com/chigwell) and [@l1v0n1](https://github.com/l1v0n1). PRs welcome.
+PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development workflow.
 
 ## Star History
 
@@ -482,6 +615,6 @@ Maintained by [@chigwell](https://github.com/chigwell) and [@l1v0n1](https://git
 
 ## Contributors
 
-<a href="https://github.com/chigwell/telegram-mcp/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=chigwell/telegram-mcp" />
+<a href="https://github.com/<YOUR_FORK_ORG>/<YOUR_FORK_REPO>/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=<YOUR_FORK_ORG>/<YOUR_FORK_REPO>" />
 </a>

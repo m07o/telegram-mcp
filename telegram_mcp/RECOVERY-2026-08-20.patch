@@ -1,0 +1,1994 @@
+diff --git a/.gitignore b/.gitignore
+index 6246352..ebb260e 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -199,3 +199,9 @@ test_upload.txt
+ test_voice.ogg
+ sticker.webp
+ two.png
++
++# SQLite media cache (created at runtime; never commit)
++*.db
++*.db-journal
++*.db-wal
++*.db-shm
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 870fe3b..edc9d2a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,18 +7,66 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/).
+ ## [Unreleased]
+ 
+ ### Added
+-- `forward_topics_from_group` MCP tool — copy all forum topics between supergroups with resume support.
+-- `job_store.py` — per-job JSON progress persistence for long-running operations.
+-- `forum_pagination.py` — shared forum-topic pagination helper (`iter_forum_topics`, `build_topic_index`, `get_topic_title`, `extract_created_topic_id`).
+-- `count_topics` MCP tool — returns the TRUE total topic count (paginating past 100-per-request limit), so AI agents don't truncate at the page boundary.
+-- `copy_topics.py` — standalone CLI for topic copying with `--check`, `--resume`, `--fix-incomplete` modes.
+-- `edit_forum_topic` MCP tool — edit a forum topic's title, icon, close/reopen, or hide/unhide in a single call. None leaves the field unchanged.
+-- `close_forum_topic` / `reopen_forum_topic` / `hide_forum_topic` / `unhide_forum_topic` MCP tools — thin wrappers around `edit_forum_topic`.
+-- `delete_topic` MCP tool — deletes every message in a topic (revoke=True) and hides the tab. Mirrors the Telegram mobile convention; there is no single RPC for forum-topic deletion in the Telegram API.
+-- `ban_users_bulk` / `unban_users_bulk` MCP tools — bulk admin actions that wrap `EditBannedRequest` per user and surface per-user failures in a JSON summary.
++- `telegram_health_check` MCP tool - local-only diagnostics (no API calls):
++  accounts and session configuration (including file permissions), last
++  connection-verification time per account, persisted migration jobs, and
++  disk space for the media DB and allowed roots.
++- `TELEGRAM_MAX_RESULT_CHARS` - optional hard cap on tool result size. Results
++  above 150k chars always log a warning; when the cap is set, oversized
++  TextContent blocks are truncated with a visible marker to protect the LLM
++  context window.
++- `duration_ms` in audit log entries - every audited tool call now records its
++  wall-clock duration.
++- Startup validation for `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` - clear
++  `SystemExit` messages instead of a raw `TypeError` when the environment is
++  misconfigured.
++- Startup warning when a file-based session is readable by group/others
++  (session files are account credentials; recommends `chmod 600`).
++
++### Changed
++- Error codes in `log_and_format_error` now use `zlib.crc32` instead of
++  `hash()`, making them stable across processes and restarts (Python string
++  hashes are randomized per process, so the old codes changed on every run).
++- Untracked `telegram_media.db` (runtime SQLite media cache) and added `*.db*`
++  to `.gitignore`.
++- Moved one-off debug scripts (`fix_end.py`, `fix_migration.py`,
++  `rest_additions.py`, `test_pipeline.py`, `tools_inventory.py`) to `scripts/`.
++- `search_tools` / `list_tool_categories` MCP tools - lightweight discovery over the
++  tool catalog (keyword search with AND semantics, category filter derived
++  dynamically from each tool's defining module), so clients can find tools without
++  loading every schema into context. No existing tool was renamed.
++- Exposure tiers for `TELEGRAM_EXPOSED_TOOLS`: `all`, `read-only`, `write`, `admin`,
++  `migration` (comma-separated lists combined by union). The `admin` tier is an
++  explicit allowlist (`ADMIN_TOOLS`) of elevated group-administration tools.
++- `telegram_mcp/audit.py` - opt-in JSONL audit log for tool calls
++  (`TELEGRAM_AUDIT_LOG`, opt-in `TELEGRAM_AUDIT_LOG_ARGS` records parameter names
++  only; argument values are never logged). Wired into the `with_account` choke
++  point, so every tool is covered.
++- Opt-in transient connection-error retry (`TELEGRAM_RETRY_TRANSIENT`, default 0,
++  capped at 5, exponential backoff with jitter) in the `with_account` wrapper.
++  Disabled by default because a reset mid-request can mean the operation already
++  reached Telegram (duplicate-message risk for send-type tools).
++- Tests for discovery, exposure tiers, audit logging, and transient retry
++  (`tests/test_tool_discovery.py`, `tests/test_audit.py`, `tests/test_retry.py`).
++
++- `forward_topics_from_group` MCP tool - copy all forum topics between supergroups with resume support.
++
++### Changed
++- Pinned `mcp[cli]` to `>=1.8.0,<2.0` in `pyproject.toml` and `requirements.txt`:
++  MCP SDK 2.x removed `mcp.server.fastmcp`, which broke server startup.
++- `runtime._get_exposed_tools_mode` now returns the validated list of tiers
++  instead of a single mode string.
++- `job_store.py` - per-job JSON progress persistence for long-running operations.
++- `forum_pagination.py` - shared forum-topic pagination helper (`iter_forum_topics`, `build_topic_index`, `get_topic_title`, `extract_created_topic_id`).
++- `count_topics` MCP tool - returns the TRUE total topic count (paginating past 100-per-request limit), so AI agents don't truncate at the page boundary.
++- `copy_topics.py` - standalone CLI for topic copying with `--check`, `--resume`, `--fix-incomplete` modes.
++- `edit_forum_topic` MCP tool - edit a forum topic's title, icon, close/reopen, or hide/unhide in a single call. None leaves the field unchanged.
++- `close_forum_topic` / `reopen_forum_topic` / `hide_forum_topic` / `unhide_forum_topic` MCP tools - thin wrappers around `edit_forum_topic`.
++- `delete_topic` MCP tool - deletes every message in a topic (revoke=True) and hides the tab. Mirrors the Telegram mobile convention; there is no single RPC for forum-topic deletion in the Telegram API.
++- `ban_users_bulk` / `unban_users_bulk` MCP tools - bulk admin actions that wrap `EditBannedRequest` per user and surface per-user failures in a JSON summary.
+ - mypy configuration (advisory mode) in `pyproject.toml`.
+ - Type hints for `copy_topics.py` and `session_string_generator.py`.
+-- `tests/fakes/telethon_client.py` — fake Telethon client with scripted responses for integration tests.
++- `tests/fakes/telethon_client.py` - fake Telethon client with scripted responses for integration tests.
+ - Tests for `extract_created_topic_id`, `count_topics`, `_validate_forum_entities`, `_copy_single_topic` (id extraction, message order, skip patterns, service messages, prompt-injection safety, `force=True` semantics), `edit_forum_topic` (12 tests covering title/closed/hidden/icon edits, validations, and rejection paths), `close/reopen/hide/unhide_forum_topic` aliases (5 delegation tests), `delete_topic` (4 tests covering empty/non-empty topic, validation paths, and the messages-then-hide sequence), `ban_users_bulk`/`unban_users_bulk` (5 tests including partial-failure handling).
+ 
+ ### Changed
+@@ -30,8 +78,8 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/).
+ ### Fixed
+ - **Critical:** `forward_topics_from_group`: every new topic creation was marked "failed" because the CreateForumTopic response was parsed for `result.messages` (empty) instead of `result.updates[].message.id`. Now uses shared `extract_created_topic_id` helper.
+ - **Critical:** `forward_topics_from_group`: messages were copied in newest-first order (Telethon default), garbling conversation flow. Now collects and reverses to send oldest-first.
+-- **Critical:** `forward_topics_from_group`: bare `"/"` message was being copied and could trigger bot commands on the destination group — now skipped like `.`/`===`/`@` patterns.
+-- **Critical:** `copy_topics.py`: same topic-creation parsing bug as above — now uses the shared helper.
++- **Critical:** `forward_topics_from_group`: bare `"/"` message was being copied and could trigger bot commands on the destination group - now skipped like `.`/`===`/`@` patterns.
++- **Critical:** `copy_topics.py`: same topic-creation parsing bug as above - now uses the shared helper.
+ - `forward_topics_from_group`: `source_count` included service/action messages but the copy loop skipped them, causing every topic with any service message to be wrongly marked `"partial"` even when fully copied. Now excludes actions and skip-pattern messages from the count.
+ - `forward_topics_from_group`: now validates both `from_chat_id` and `to_chat_id` are forum-enabled supergroups before processing (previously produced dozens of cryptic "failed" entries when a non-forum group was passed).
+ - `forward_topics_from_group`: docstring now carries the standard untrusted-content prompt-injection warning used on every other user-content-returning tool.
+diff --git a/README.md b/README.md
+index b249e5a..3829624 100644
+--- a/README.md
++++ b/README.md
+@@ -36,12 +36,13 @@ Message sent successfully:
+ - [Docker](#docker)
+ - [Development](#development)
+ - [Security Notes](#security-notes)
++- [Audit Logging and Transient Retry](#audit-logging-and-transient-retry)
+ - [Troubleshooting](#troubleshooting)
+ - [License](#license)
+ 
+ ## What It Can Do
+ 
+-The server currently includes 80+ MCP tools grouped into these areas:
++The server currently includes 160+ MCP tools grouped into these areas:
+ 
+ - **Accounts:** list configured accounts and route tool calls by account label.
+ - **Chats and groups:** list chats, inspect metadata, create groups/channels, join or leave chats, invite users, manage admins, bans, default permissions, slow mode, topics, invite links, common chats, read receipts, and message links.
+@@ -50,6 +51,8 @@ The server currently includes 80+ MCP tools grouped into these areas:
+ - **Media:** send files, download media, upload files, send voice notes, stickers, GIFs, and inspect message media.
+ - **Profile and privacy:** get your own account info, update profile fields, set or delete profile photos, inspect privacy settings, get user info/photos/status, and manage bot commands.
+ - **Folders and drafts:** list, create, update, reorder, and delete Telegram folders; save, list, and clear drafts.
++- **Discovery:** `list_tool_categories` and `search_tools` let MCP clients browse or search the tool catalog by keyword/category without loading every tool schema into context.
++- **Diagnostics:** `telegram_health_check` reports server health locally (no API calls): account/session configuration and file permissions, last connection verification, persisted migration jobs, and disk space.
+ 
+ All tool results that include Telegram user-controlled content are sanitized and, where practical, returned as structured JSON.
+ 
+@@ -113,20 +116,29 @@ TELEGRAM_API_HASH=your_api_hash_here
+ TELEGRAM_SESSION_STRING=your_session_string_here
+ ```
+ 
+-By default, all Telegram MCP tools are exposed. If you want to prevent MCP
+-clients from sending messages or performing chat/account mutations, set
+-`TELEGRAM_EXPOSED_TOOLS=read-only` to expose only tools annotated with
+-`readOnlyHint=True`:
++By default, all Telegram MCP tools are exposed. You can restrict the tool
++surface with `TELEGRAM_EXPOSED_TOOLS`. Accepted tiers (a single tier or a
++comma-separated list, combined by union):
++
++| Tier        | Keeps                                                        |
++|-------------|--------------------------------------------------------------|
++| `all`       | Every registered tool (the default)                          |
++| `read-only` | Tools annotated `readOnlyHint=True`                          |
++| `write`     | All other non-read-only tools                                |
++| `admin`     | Elevated group-administration tools (see `ADMIN_TOOLS` in `telegram_mcp/runtime.py`) |
++| `migration` | Tools defined in `telegram_mcp/tools/migration.py`           |
+ 
+ ```env
++# Read-only deployment
+ TELEGRAM_EXPOSED_TOOLS=read-only
++# Read-only plus migration job tools (e.g. a worker that only inspects and migrates)
++TELEGRAM_EXPOSED_TOOLS=read-only,migration
+ ```
+ 
+ This is an MCP tool-surface restriction, not a Telegram session sandbox or
+ reduced Telegram account permission. The Telegram session string still has its
+-normal authority inside the server process; read-only mode only prevents
+-non-read-only tools from being registered and exposed through MCP. Accepted
+-values are `all` (the default) and `read-only`.
++normal authority inside the server process; a restricted tier only prevents
++tools outside the selected tiers from being registered and exposed through MCP.
+ 
+ Run the server locally:
+ 
+@@ -216,7 +228,7 @@ For `http` and `sse`, the server binds `MCP_HOST`:`MCP_PORT` (default
+ 
+ Prefer `http` when more than one MCP client (or many coding-agent sessions)
+ will use the server: a single long-lived process holds one Telegram
+-connection, instead of every client spawning its own Telethon session —
++connection, instead of every client spawning its own Telethon session -
+ Telegram throttles and may flag accounts that open many parallel sessions.
+ 
+ Register the shared server with clients:
+@@ -413,7 +425,7 @@ docker run -d --name telegram-mcp --restart unless-stopped \
+ 
+ `MCP_HOST=0.0.0.0` binds inside the container so the published port works;
+ `-p 127.0.0.1:8765:8765` keeps the server reachable only from the local
+-machine — the endpoint is unauthenticated, so never publish it on a public
++machine - the endpoint is unauthenticated, so never publish it on a public
+ interface.
+ 
+ The bundled Compose file runs the same setup:
+@@ -494,6 +506,8 @@ uv run flake8 .
+ - By default, Telegram API calls go directly from your machine/container to Telegram.
+   If `TELEGRAM_PROXY_*` is configured, Telegram traffic is routed through the
+   configured SOCKS/HTTP/MTProxy proxy instead.
++- Session files must stay `600`. The server warns at startup when a file-based
++  session is group/world readable.
+ - User-generated Telegram content is sanitized before being returned to MCP clients.
+ 
+ ### Prompt Injection Protection
+@@ -506,6 +520,62 @@ Telegram messages, display names, chat titles, and button labels are untrusted c
+ - Tool descriptions that warn clients not to treat returned Telegram fields as model instructions.
+ - No brittle keyword-based filtering.
+ 
++## Audit Logging and Transient Retry
++
++### Audit logging
++
++Every tool call can be traced by appending JSON lines (one per call) to a file.
++Disabled by default; enable with:
++
++```env
++TELEGRAM_AUDIT_LOG=/var/log/telegram-mcp/audit.jsonl
++```
++
++Each line contains a UTC timestamp, tool name, account label, and outcome
++(`ok`, or the exception class name on failure). Argument **values are never
++logged** - set `TELEGRAM_AUDIT_LOG_ARGS=1` to also record parameter *names*.
++Audit write failures are swallowed (logged as a warning) so they can never
++break a tool call.
++
++### Transient retry
++
++A connection reset or timeout mid-request is ambiguous: the operation may
++already have reached Telegram, and blindly retrying a send-type tool could
++duplicate messages. Telethon already handles FloodWait and transport-level
++retries internally, so a central retry is **opt-in**:
++
++```env
++# Retry transient connection errors up to 2 times (backoff 1s, 2s, ... capped 10s).
++TELEGRAM_RETRY_TRANSIENT=2
++```
++
++Default is `0` (disabled). Only `ConnectionError`/`TimeoutError` are eligible;
++server-side RPC errors are never retried.
++
++### Result size cap
++
++Oversized tool results bloat the LLM context window (and cost). Results
++larger than 150,000 characters always log a server-side warning. To enforce a
++hard cap, set:
++
++```env
++TELEGRAM_MAX_RESULT_CHARS=100000
++```
++
++Oversized results are then truncated with a visible
++`...[truncated by TELEGRAM_MAX_RESULT_CHARS]` marker. Without the variable,
++results are left intact (so structured JSON stays valid).
++
++### Session file permissions
++
++At startup the server warns when a file-based session is readable by
++group/others (`chmod 644` etc.). A session file is the account's credential -
++keep it `600`:
++
++```bash
++chmod 600 myaccount.session
++```
++
+ ## Troubleshooting
+ 
+ - **No Telegram session configured:** set `TELEGRAM_SESSION_STRING`, `TELEGRAM_SESSION_NAME`, or suffixed multi-account variants.
+@@ -535,7 +605,7 @@ This project is licensed under the [Apache 2.0 License](LICENSE).
+ - [Telethon](https://github.com/LonamiWebs/Telethon)
+ - [Model Context Protocol](https://modelcontextprotocol.io/)
+ - [Claude](https://www.anthropic.com/) and [Cursor](https://cursor.so/)
+-- [chigwell/telegram-mcp](https://github.com/chigwell/telegram-mcp) — upstream project this fork is built on top of
++- [chigwell/telegram-mcp](https://github.com/chigwell/telegram-mcp) - upstream project this fork is built on top of
+ 
+ PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development workflow.
+ 
+diff --git a/SECURITY.md b/SECURITY.md
+index cbc268f..8d379b3 100644
+--- a/SECURITY.md
++++ b/SECURITY.md
+@@ -28,4 +28,14 @@ We aim to acknowledge reports within 48 hours and provide a fix or mitigation wi
+ - **Session strings** grant full access to the associated Telegram account. Treat them like passwords.
+ - **API credentials** (`TELEGRAM_API_ID`, `TELEGRAM_API_HASH`) should never be committed or logged.
+ - **File-path security** restricts which files the MCP server can access. Bypassing this is a security issue.
+-- **Prompt injection** — Telegram content (messages, names, titles) is untrusted. The server sanitizes returned content, but MCP clients should not treat returned Telegram fields as model instructions.
++- **Tool-surface restriction** (`TELEGRAM_EXPOSED_TOOLS`) prunes which MCP tools are
++  registered. It is a tool-surface restriction, not a session sandbox: the session
++  string keeps its full authority inside the server process. The `admin` tier is
++  defined by an explicit, auditable allowlist (`ADMIN_TOOLS` in
++  `telegram_mcp/runtime.py`); adding a tool to that list is a security-relevant
++  change that must be reviewed.
++- **Audit logging** (`TELEGRAM_AUDIT_LOG`) never records tool argument values or
++  credentials - only tool names, account labels, outcomes, and (opt-in) parameter
++  names. A regression that logs argument values or session material is a security
++  issue.
++- **Prompt injection** - Telegram content (messages, names, titles) is untrusted. The server sanitizes returned content, but MCP clients should not treat returned Telegram fields as model instructions.
+diff --git a/pyproject.toml b/pyproject.toml
+index fc9401d..fd1315b 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -25,7 +25,7 @@ requires-python = ">=3.10"
+ dependencies = [
+     "dotenv>=0.9.9",
+     "httpx>=0.28.1",
+-    "mcp[cli]>=1.8.0",
++    "mcp[cli]>=1.8.0,<2.0",
+     "nest-asyncio>=1.6.0",
+     "python-dotenv>=1.1.0",
+     "python-json-logger>=3.3.0",
+diff --git a/requirements.txt b/requirements.txt
+index 5c7ebcf..e8edf41 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,6 +1,6 @@
+ dotenv>=0.9.9
+ httpx>=0.28.1
+-mcp[cli]>=1.8.0
++mcp[cli]>=1.8.0,<2.0
+ nest-asyncio>=1.6.0
+ python-dotenv>=1.1.0
+ python-json-logger>=3.3.0
+diff --git a/fix_end.py b/scripts/fix_end.py
+similarity index 100%
+rename from fix_end.py
+rename to scripts/fix_end.py
+diff --git a/fix_migration.py b/scripts/fix_migration.py
+similarity index 100%
+rename from fix_migration.py
+rename to scripts/fix_migration.py
+diff --git a/rest_additions.py b/scripts/rest_additions.py
+similarity index 100%
+rename from rest_additions.py
+rename to scripts/rest_additions.py
+diff --git a/test_pipeline.py b/scripts/test_pipeline.py
+similarity index 100%
+rename from test_pipeline.py
+rename to scripts/test_pipeline.py
+diff --git a/tools_inventory.py b/scripts/tools_inventory.py
+similarity index 100%
+rename from tools_inventory.py
+rename to scripts/tools_inventory.py
+diff --git a/telegram_mcp/audit.py b/telegram_mcp/audit.py
+new file mode 100644
+index 0000000..bf5a3c0
+--- /dev/null
++++ b/telegram_mcp/audit.py
+@@ -0,0 +1,99 @@
++"""Audit logging for telegram-mcp tool calls.
++
++Appends one JSON line per audited tool invocation. Disabled by default;
++enable by setting ``TELEGRAM_AUDIT_LOG`` to a file path.
++
++Security properties:
++
++- Never logs tool argument *values* - only argument *names*, and only when
++  ``TELEGRAM_AUDIT_LOG_ARGS=1``.
++- Never logs credentials (session strings, API keys, proxy URLs); none of
++  the audited fields can contain them.
++- Audit failures are swallowed (warning logged) so they can never break a
++  tool call.
++"""
++
++import json
++import logging
++import os
++import threading
++from datetime import datetime, timezone
++from pathlib import Path
++from typing import Optional
++
++logger = logging.getLogger(__name__)
++
++_LOCK = threading.Lock()
++
++
++def _parse_bool_env(value: Optional[str], default: bool = False) -> bool:
++    if value is None:
++        return default
++    return value.strip().lower() in {"1", "true", "yes", "on"}
++
++
++def audit_enabled() -> bool:
++    """Return True when a TELEGRAM_AUDIT_LOG path is configured."""
++    return bool(os.getenv("TELEGRAM_AUDIT_LOG"))
++
++
++def _audit_path() -> Optional[Path]:
++    raw = os.getenv("TELEGRAM_AUDIT_LOG")
++    if not raw or not raw.strip():
++        return None
++    return Path(raw).expanduser()
++
++
++def record_audit(
++    *,
++    tool_name: str,
++    account: Optional[str] = None,
++    ok: bool,
++    error: Optional[str] = None,
++    arg_names: Optional[list[str]] = None,
++    duration_ms: Optional[float] = None,
++) -> None:
++    """Append one audit entry. Never raises.
++
++    Args:
++        tool_name: MCP tool name.
++        account: account label the call was routed to, if any.
++        ok: final outcome of the call (after any retries).
++        error: exception class name when ``ok`` is False.
++        arg_names: tool parameter names; only written when
++            ``TELEGRAM_AUDIT_LOG_ARGS=1``. Values are never recorded.
++        duration_ms: wall-clock duration of the call, in milliseconds.
++    """
++    path = _audit_path()
++    if path is None:
++        return
++
++    entry: dict = {
++        "ts": datetime.now(timezone.utc).isoformat(),
++        "tool": tool_name,
++        "account": account,
++        "ok": bool(ok),
++    }
++    if duration_ms is not None:
++        entry["duration_ms"] = round(float(duration_ms), 3)
++    if error:
++        entry["error"] = str(error)[:200]
++    if _parse_bool_env(os.getenv("TELEGRAM_AUDIT_LOG_ARGS")):
++        entry["arg_names"] = sorted(set(arg_names or []))
++
++    try:
++        line = json.dumps(entry, ensure_ascii=False)
++    except Exception:
++        logger.warning("audit: failed to serialize entry for tool %s", tool_name)
++        return
++
++    try:
++        with _LOCK:
++            if path.parent and not path.parent.exists():
++                path.parent.mkdir(parents=True, exist_ok=True)
++            with path.open("a", encoding="utf-8") as fh:
++                fh.write(line + "\n")
++    except Exception:
++        logger.warning(
++            "audit: failed to write to %s for tool %s", path, tool_name, exc_info=True
++        )
+diff --git a/telegram_mcp/runtime.py b/telegram_mcp/runtime.py
+index c807396..5ddd1be 100644
+--- a/telegram_mcp/runtime.py
++++ b/telegram_mcp/runtime.py
+@@ -3,7 +3,9 @@ import asyncio
+ import os
+ import sys
+ import json
++import random
+ import time
++import zlib
+ import sqlite3
+ import logging
+ import mimetypes
+@@ -18,7 +20,7 @@ from dotenv import load_dotenv
+ from mcp.server.fastmcp import FastMCP, Context
+ from mcp.types import Annotations, TextContent, ToolAnnotations
+ from mcp.shared.exceptions import McpError
+-from pythonjsonlogger import jsonlogger
++from pythonjsonlogger.json import JsonFormatter
+ from telethon import TelegramClient, functions, types, utils
+ from telethon.sessions import StringSession
+ from telethon.tl.types import (
+@@ -44,6 +46,7 @@ import re
+ from functools import wraps
+ import telethon.errors.rpcerrorlist
+ from sanitize import sanitize_user_content, sanitize_name, sanitize_dict, format_tool_result
++from telegram_mcp import audit
+ from telegram_mcp.client_identity import client_identity_kwargs
+ 
+ 
+@@ -102,8 +105,31 @@ try:
+ except Exception as e:
+     print(f"WARNING: Failed to load .env file: {e}", file=sys.stderr)
+ 
+-TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
++def _require_env_int(name: str) -> int:
++    """Read a required integer env var with a friendly failure message."""
++    raw = os.getenv(name)
++    if not raw or not raw.strip():
++        raise SystemExit(
++            f"Missing required environment variable {name}. "
++            "Get TELEGRAM_API_ID and TELEGRAM_API_HASH from "
++            "https://my.telegram.org/apps and set them in your environment or .env."
++        )
++    try:
++        return int(raw)
++    except ValueError:
++        raise SystemExit(
++            f"Environment variable {name} must be an integer, got {raw!r}."
++        ) from None
++
++
++TELEGRAM_API_ID = _require_env_int("TELEGRAM_API_ID")
+ TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
++if not TELEGRAM_API_HASH or not TELEGRAM_API_HASH.strip():
++    raise SystemExit(
++        "Missing required environment variable TELEGRAM_API_HASH. "
++        "Get it from https://my.telegram.org/apps and set it in your "
++        "environment or .env."
++    )
+ 
+ mcp = FastMCP("telegram")
+ 
+@@ -114,6 +140,55 @@ mcp = FastMCP("telegram")
+ _USER_AUDIENCE = Annotations(audience=["user"])
+ 
+ 
++_RESULT_WARN_CHARS = 150_000
++_RESULT_TRUNCATION_MARKER = "\n...[truncated by TELEGRAM_MAX_RESULT_CHARS]"
++
++
++def _get_max_result_chars() -> Optional[int]:
++    """Optional hard cap on tool result size (``TELEGRAM_MAX_RESULT_CHARS``)."""
++    raw = os.getenv("TELEGRAM_MAX_RESULT_CHARS")
++    if not raw or not raw.strip():
++        return None
++    try:
++        value = int(raw)
++    except ValueError:
++        logger.warning("Invalid TELEGRAM_MAX_RESULT_CHARS %r; ignoring it", raw)
++        return None
++    return value if value > 0 else None
++
++
++def _apply_result_size_policy(content: list, tool_name: str = "unknown") -> list:
++    """Warn on oversized results; truncate when TELEGRAM_MAX_RESULT_CHARS is set.
++
++    By default the result is left intact (so structured JSON stays valid) and
++    only a warning is logged. Setting ``TELEGRAM_MAX_RESULT_CHARS`` truncates
++    every TextContent block above the cap and appends a visible marker.
++    """
++    total_chars = sum(len(b.text) for b in content if isinstance(b, TextContent))
++    if total_chars > _RESULT_WARN_CHARS:
++        logger.warning(
++            "Tool %s returned a large result (%d chars; warn threshold %d); "
++            "consider pagination or a result limit",
++            tool_name,
++            total_chars,
++            _RESULT_WARN_CHARS,
++        )
++    cap = _get_max_result_chars()
++    if not cap:
++        return content
++    truncated = []
++    for block in content:
++        if isinstance(block, TextContent) and len(block.text) > cap:
++            truncated.append(
++                block.model_copy(
++                    update={"text": block.text[:cap] + _RESULT_TRUNCATION_MARKER}
++                )
++            )
++        else:
++            truncated.append(block)
++    return truncated
++
++
+ def _install_annotation_hook() -> None:
+     from mcp.types import CallToolRequest, ServerResult, CallToolResult
+ 
+@@ -124,7 +199,7 @@ def _install_annotation_hook() -> None:
+         if isinstance(response, ServerResult) and isinstance(response.root, CallToolResult):
+             content = response.root.content
+             if content:
+-                response.root.content = [
++                annotated = [
+                     (
+                         block.model_copy(update={"annotations": _USER_AUDIENCE})
+                         if isinstance(block, TextContent) and block.annotations is None
+@@ -132,6 +207,8 @@ def _install_annotation_hook() -> None:
+                     )
+                     for block in content
+                 ]
++                tool_name = getattr(req.params, "name", None) or "unknown"
++                response.root.content = _apply_result_size_policy(annotated, tool_name)
+         return response
+ 
+     mcp._mcp_server.request_handlers[CallToolRequest] = annotated_handler
+@@ -140,35 +217,97 @@ def _install_annotation_hook() -> None:
+ _install_annotation_hook()
+ 
+ 
+-_EXPOSED_TOOLS_MODES = {"all", "read-only"}
++_EXPOSED_TOOLS_MODES = {"all", "read-only", "write", "admin", "migration"}
++
++# Admin-tier tools: group administration operations with elevated impact.
++# Kept as an explicit, auditable list (not annotation-based) so the exact
++# tools a "admin" deployment can call are always visible here.
++ADMIN_TOOLS: frozenset = frozenset(
++    {
++        "promote_admin",
++        "demote_admin",
++        "edit_admin_rights",
++        "ban_user",
++        "unban_user",
++        "ban_users_bulk",
++        "unban_users_bulk",
++        "set_default_chat_permissions",
++        "toggle_slow_mode",
++    }
++)
++
++
++def _get_exposed_tools_mode(value: Optional[str] = None) -> list[str]:
++    """Return the configured MCP tool exposure tiers, validated.
+ 
++    ``TELEGRAM_EXPOSED_TOOLS`` accepts a single tier or a comma-separated
++    list, e.g. ``read-only,write``. Tiers:
+ 
+-def _get_exposed_tools_mode(value: Optional[str] = None) -> str:
+-    """Return the configured MCP tool exposure mode.
++    - ``all``: every registered tool (default, backward compatible).
++    - ``read-only``: tools annotated ``readOnlyHint=True``.
++    - ``write``: all other non-read-only tools.
++    - ``admin``: elevated group-administration tools (see ``ADMIN_TOOLS``).
++    - ``migration``: tools defined in ``telegram_mcp.tools.migration``.
+ 
+-    ``TELEGRAM_EXPOSED_TOOLS=read-only`` keeps only tools annotated with
+-    ``readOnlyHint=True``. The default is ``all`` for backward compatibility.
++    Multiple tiers are combined by union. Unknown values fail fast at
++    startup with ``SystemExit``.
+     """
+     raw_value = os.getenv("TELEGRAM_EXPOSED_TOOLS", "all") if value is None else value
+-    mode = raw_value.strip().lower()
+-    if mode not in _EXPOSED_TOOLS_MODES:
++    tiers = [part.strip().lower() for part in raw_value.split(",") if part.strip()]
++    if not tiers:
++        tiers = ["all"]
++    invalid = [tier for tier in tiers if tier not in _EXPOSED_TOOLS_MODES]
++    if invalid:
+         accepted = ", ".join(sorted(_EXPOSED_TOOLS_MODES))
+         raise SystemExit(
+-            f"Invalid TELEGRAM_EXPOSED_TOOLS '{raw_value}'. Expected one of: {accepted}."
++            f"Invalid TELEGRAM_EXPOSED_TOOLS '{raw_value}'. "
++            f"Expected one of (or a comma-separated list of): {accepted}."
+         )
+-    return mode
++    # De-duplicate while preserving order.
++    seen = set()
++    ordered = []
++    for tier in tiers:
++        if tier not in seen:
++            seen.add(tier)
++            ordered.append(tier)
++    return ordered
++
++
++def _tool_tier(tool) -> str:
++    """Classify a registered tool into exactly one exposure tier.
++
++    Classification is least-privilege first: a read-only tool is always
++    ``read-only`` even if defined in the migration module, and an admin
++    tool is never ``write``.
++    """
++    annotations = getattr(tool, "annotations", None)
++    if getattr(annotations, "readOnlyHint", False):
++        return "read-only"
++    if tool.name in ADMIN_TOOLS:
++        return "admin"
++    fn = getattr(tool, "fn", None)
++    module = getattr(fn, "__module__", "") or ""
++    if module == "telegram_mcp.tools.migration":
++        return "migration"
++    return "write"
+ 
+ 
+ def _apply_exposed_tools_mode(server: FastMCP = mcp, mode: Optional[str] = None) -> list[str]:
+-    """Prune registered MCP tools according to the configured exposure mode."""
+-    selected_mode = _get_exposed_tools_mode() if mode is None else _get_exposed_tools_mode(mode)
+-    if selected_mode == "all":
++    """Prune registered MCP tools according to the configured exposure tiers.
++
++    A tool is kept when its tier (see ``_tool_tier``) is among the selected
++    tiers, or when ``all`` is selected. Returns the names of removed tools.
++    """
++    selected_tiers = (
++        _get_exposed_tools_mode() if mode is None else _get_exposed_tools_mode(mode)
++    )
++    if "all" in selected_tiers:
+         return []
+ 
++    allowed = set(selected_tiers)
+     removed: list[str] = []
+     for tool in list(server._tool_manager.list_tools()):
+-        annotations = getattr(tool, "annotations", None)
+-        if not getattr(annotations, "readOnlyHint", False):
++        if _tool_tier(tool) not in allowed:
+             server._tool_manager.remove_tool(tool.name)
+             removed.append(tool.name)
+     return removed
+@@ -331,7 +470,36 @@ def _discover_accounts() -> dict[str, TelegramClient]:
+     return accounts
+ 
+ 
++def _warn_world_readable_sessions() -> None:
++    """Warn at startup when a file-based session is readable by group/others.
++
++    A session file is effectively the account's password; 0644 means anyone
++    on the host can read it. Warning (not failing) so an operator can fix
++    the permissions without losing access to a running deployment.
++    """
++    for label, cl in clients.items():
++        session = getattr(cl, "session", None)
++        session_file = getattr(session, "session_file", None)
++        if not isinstance(session_file, str):
++            continue
++        try:
++            mode = os.stat(session_file).st_mode & 0o777
++        except OSError:
++            continue
++        if mode & 0o007:
++            logger.warning(
++                "Session file for account %r (%s) is readable by group/others "
++                "(mode %03o). A session file is the account's credential - "
++                "run: chmod 600 %s",
++                label,
++                session_file,
++                mode,
++                session_file,
++            )
++
++
+ clients: dict[str, TelegramClient] = _discover_accounts()
++_warn_world_readable_sessions()
+ 
+ 
+ def get_client(account: str = None) -> TelegramClient:
+@@ -354,6 +522,35 @@ def is_multi_mode() -> bool:
+     return len(clients) > 1
+ 
+ 
++# Connection-level errors eligible for optional transient retry. Kept
++# deliberately narrow: server-side RPC errors are NOT retried here because
++# they are unambiguous outcomes, and retrying send-type tools on them could
++# duplicate side effects.
++_TRANSIENT_EXCEPTIONS = (ConnectionError, TimeoutError)
++
++
++def _get_transient_retry_count() -> int:
++    """Return how many times transient connection errors may be retried.
++
++    ``TELEGRAM_RETRY_TRANSIENT`` (default ``0`` = disabled). Capped at 5.
++    Opt-in by design: a reset mid-request may mean the operation already
++    reached Telegram, so automatic retries are a safety valve for flaky
++    networks, not the default behavior.
++    """
++    raw = os.getenv("TELEGRAM_RETRY_TRANSIENT", "0")
++    try:
++        value = int(raw)
++    except ValueError:
++        logger.warning("Invalid TELEGRAM_RETRY_TRANSIENT '%s'; defaulting to 0", raw)
++        return 0
++    return max(0, min(value, 5))
++
++
++def _backoff_delay(attempt: int) -> float:
++    """Exponential backoff (1s, 2s, 4s, ...) capped at 10s, plus jitter."""
++    return min(2 ** (attempt - 1), 10.0) + random.uniform(0, 0.5)
++
++
+ def with_account(readonly=False):
+     """Decorator that adds multi-account support to MCP tools.
+ 
+@@ -368,13 +565,64 @@ def with_account(readonly=False):
+     """
+ 
+     def decorator(fn):
++        tool_name = getattr(fn, "__name__", "unknown")
++
++        async def _invoke(account_label, *args, **kwargs):
++            """Single invocation with optional transient retry and audit.
++
++            Retry is OPT-IN (``TELEGRAM_RETRY_TRANSIENT``, default 0) because
++            a connection reset mid-request is ambiguous - the operation may
++            already have reached Telegram, and a blind retry of a send-type
++            tool could duplicate messages. Only connection-level errors
++            (``ConnectionError``/``TimeoutError``) are eligible; Telethon
++            already handles FloodWait and server-level retries internally.
++            """
++            arg_names = [k for k in kwargs if k != "account"]
++            max_retries = _get_transient_retry_count()
++            attempt = 0
++            started = time.monotonic()
++            while True:
++                try:
++                    result = await fn(*args, **kwargs)
++                    audit.record_audit(
++                        tool_name=tool_name,
++                        account=account_label,
++                        ok=True,
++                        arg_names=arg_names,
++                        duration_ms=(time.monotonic() - started) * 1000,
++                    )
++                    return result
++                except Exception as exc:
++                    if isinstance(exc, _TRANSIENT_EXCEPTIONS) and attempt < max_retries:
++                        attempt += 1
++                        delay = _backoff_delay(attempt)
++                        logger.warning(
++                            "Transient error in %s (%s); retry %d/%d in %.1fs",
++                            tool_name,
++                            type(exc).__name__,
++                            attempt,
++                            max_retries,
++                            delay,
++                        )
++                        await asyncio.sleep(delay)
++                        continue
++                    audit.record_audit(
++                        tool_name=tool_name,
++                        account=account_label,
++                        ok=False,
++                        error=type(exc).__name__,
++                        arg_names=arg_names,
++                        duration_ms=(time.monotonic() - started) * 1000,
++                    )
++                    raise
++
+         @wraps(fn)
+         async def wrapper(*args, **kwargs):
+             account = kwargs.get("account")
+ 
+             # Explicit account OR single-mode -> call once
+             if account is not None or not is_multi_mode():
+-                return await fn(*args, **kwargs)
++                return await _invoke(account, *args, **kwargs)
+ 
+             # account is None AND multi-mode
+             if not readonly:
+@@ -385,7 +633,7 @@ def with_account(readonly=False):
+             async def _call_for(label):
+                 kw = dict(kwargs)
+                 kw["account"] = label
+-                return label, await fn(*args, **kw)
++                return label, await _invoke(label, *args, **kw)
+ 
+             results = await asyncio.gather(*(_call_for(label) for label in clients))
+             return "\n\n".join(f"[{label}]\n{result}" for label, result in results)
+@@ -474,7 +722,7 @@ try:
+     console_handler.setFormatter(console_formatter)
+ 
+     # File formatter is now JSON
+-    json_formatter = jsonlogger.JsonFormatter(
++    json_formatter = JsonFormatter(
+         "%(asctime)s %(name)s %(levelname)s %(message)s",
+         datefmt="%Y-%m-%dT%H:%M:%S%z",
+     )
+@@ -567,7 +815,11 @@ def log_and_format_error(
+                     break
+ 
+         prefix_str = prefix.value if isinstance(prefix, ErrorCategory) else (prefix or "GEN")
+-        error_code = f"{prefix_str}-ERR-{abs(hash(function_name)) % 1000:03d}"
++        # crc32 (unlike hash()) is stable across processes and restarts, so
++        # error codes can be correlated between log files and runs.
++        error_code = (
++            f"{prefix_str}-ERR-{zlib.crc32(function_name.encode('utf-8')) % 1000:03d}"
++        )
+ 
+     # Format the additional context parameters
+     context = ", ".join(f"{k}={v}" for k, v in kwargs.items())
+diff --git a/telegram_mcp/tools/__init__.py b/telegram_mcp/tools/__init__.py
+index d0e2653..fb73c9c 100644
+--- a/telegram_mcp/tools/__init__.py
++++ b/telegram_mcp/tools/__init__.py
+@@ -13,5 +13,7 @@ from telegram_mcp.tools.forum_forward import *
+ from telegram_mcp.tools.content import *
+ from telegram_mcp.tools.migration import *
+ from telegram_mcp.tools.database import *
++from telegram_mcp.tools.discovery import *
++from telegram_mcp.tools.diagnostics import *
+ 
+ __all__ = [name for name in globals() if not name.startswith("_")]
+diff --git a/telegram_mcp/tools/chats.py b/telegram_mcp/tools/chats.py
+index e763850..9563787 100644
+--- a/telegram_mcp/tools/chats.py
++++ b/telegram_mcp/tools/chats.py
+@@ -378,6 +378,8 @@ async def list_topics(
+ 
+     IMPORTANT: Telegram returns topics in pages of max 100. To get ALL topics,
+     you MUST pass fetch_all=True (do not assume limit=100 returns everything).
++    When a single page comes back full, the result JSON includes a "warning"
++    field — never treat a result without "total_topics" as complete.
+     To get just the count, use count_topics instead — it's faster.
+     For manual pagination: pass offset_topic = the last topic ID from the previous batch.
+     To RESUME a migration from a specific topic ID (e.g., 28068), set offset_topic=28068
+@@ -413,10 +415,13 @@ async def list_topics(
+         normalized_search = normalize_forum_title(search_query) if search_query else None
+ 
+         all_records = []
++        fetched_total = 0
++        raw_page_full = False
+ 
+         if fetch_all:
+             # Use the shared pagination helper to get ALL topics
+             async for topic in iter_forum_topics(cl, entity, page_size=limit):
++                fetched_total += 1
+                 title = getattr(topic, "title", None) or "(no title)"
+ 
+                 if normalized_search:
+@@ -469,6 +474,8 @@ async def list_topics(
+             topics = getattr(result, "topics", None) or []
+             if not topics:
+                 return "No topics found for this chat."
++            # A full page means Telegram very likely has more topics.
++            raw_page_full = len(topics) >= limit
+ 
+             messages_map = {}
+             if getattr(result, "messages", None):
+@@ -508,7 +515,22 @@ async def list_topics(
+         if not all_records:
+             return "No topics found for this chat."
+ 
+-        return format_tool_result(all_records)
++        # Make truncation visible IN the result: an agent that ignores the
++        # docstring must not be able to mistake one 100-topic page for the
++        # complete list.
++        metadata = {}
++        if fetch_all:
++            metadata["total_topics"] = fetched_total
++            if normalized_search:
++                metadata["matched_topics"] = len(all_records)
++        elif raw_page_full:
++            metadata["warning"] = (
++                "This is ONE page only: Telegram returns max 100 topics per "
++                "request and this page is full, so more topics likely exist. "
++                "Use count_topics for the total count, or call list_topics "
++                "again with fetch_all=True to get every topic."
++            )
++        return format_tool_result(all_records, metadata or None)
+     except Exception as e:
+         return log_and_format_error(
+             "list_topics",
+diff --git a/telegram_mcp/tools/diagnostics.py b/telegram_mcp/tools/diagnostics.py
+new file mode 100644
+index 0000000..248ae13
+--- /dev/null
++++ b/telegram_mcp/tools/diagnostics.py
+@@ -0,0 +1,112 @@
++"""Diagnostics MCP tools.
++
++Local-only health reporting: no Telegram API calls are made, so this works
++even when disconnected and is safe to expose in read-only deployments.
++"""
++
++import os
++import shutil
++import time
++
++from telegram_mcp.db_setup import get_db_path
++from telegram_mcp.job_store import JobStore
++from telegram_mcp.runtime import *
++from telegram_mcp.runtime import _last_conn_verified  # noqa: F401  (dict ref)
++
++_JOB_BASE_DIR_ENV = "TELEGRAM_JOBS_DIR"
++
++
++def _session_file_info(session) -> dict:
++    """Describe a Telethon session (string or file) without leaking values."""
++    session_file = getattr(session, "session_file", None)
++    info = {
++        "session_type": "string" if isinstance(session, StringSession) else "file",
++        "session_file": session_file if isinstance(session_file, str) else None,
++        "session_file_mode": None,
++        "session_file_readable_by_others": None,
++    }
++    if isinstance(session_file, str) and os.path.exists(session_file):
++        try:
++            mode = os.stat(session_file).st_mode & 0o777
++        except OSError:
++            return info
++        info["session_file_mode"] = format(mode, "03o")
++        info["session_file_readable_by_others"] = bool(mode & 0o007)
++    return info
++
++
++@mcp.tool(
++    annotations=ToolAnnotations(
++        title="Health Check",
++        readOnlyHint=True,
++        openWorldHint=False,
++        idempotentHint=True,
++    )
++)
++async def telegram_health_check() -> str:
++    """Check the health of this Telegram MCP server (local-only, no API calls).
++
++    Reports: configured accounts and their session configuration
++    (including file permissions), how recently each account's connection was
++    verified, active/persisted migration jobs, and disk space for the media
++    database and allowed file roots. Use this to self-diagnose before and
++    after operations.
++    """
++    now = time.time()
++
++    accounts = []
++    for label, cl in clients.items():
++        last_verified = _last_conn_verified.get(id(cl))
++        accounts.append(
++            {
++                "label": label,
++                **_session_file_info(getattr(cl, "session", None)),
++                "seconds_since_last_connection_verified": (
++                    round(now - last_verified, 1) if last_verified is not None else None
++                ),
++            }
++        )
++
++    # Disk space for the places the server writes to.
++    disk = {}
++    db_dir = str(Path(get_db_path()).parent)
++    try:
++        usage = shutil.disk_usage(db_dir)
++        disk["media_db_dir"] = {
++            "path": db_dir,
++            "free_gb": round(usage.free / 1024**3, 2),
++            "total_gb": round(usage.total / 1024**3, 2),
++        }
++    except OSError:
++        disk["media_db_dir"] = None
++    for root in SERVER_ALLOWED_ROOTS:
++        try:
++            usage = shutil.disk_usage(str(root))
++            disk[f"root:{root}"] = {
++                "path": str(root),
++                "free_gb": round(usage.free / 1024**3, 2),
++                "total_gb": round(usage.total / 1024**3, 2),
++            }
++        except OSError:
++            disk[f"root:{root}"] = None
++
++    try:
++        jobs = sorted(JobStore().list_jobs())
++    except Exception:
++        jobs = []
++
++    payload = {
++        "server": {
++            "multi_account_mode": is_multi_mode(),
++            "accounts_configured": len(clients),
++            "allowed_roots_configured": len(SERVER_ALLOWED_ROOTS),
++            "audit_log_enabled": bool(os.getenv("TELEGRAM_AUDIT_LOG")),
++        },
++        "accounts": accounts,
++        "disk": disk,
++        "migration_jobs": jobs,
++    }
++    return json.dumps(payload, indent=2, ensure_ascii=False)
++
++
++__all__ = ["telegram_health_check"]
+diff --git a/telegram_mcp/tools/discovery.py b/telegram_mcp/tools/discovery.py
+new file mode 100644
+index 0000000..1db5f7f
+--- /dev/null
++++ b/telegram_mcp/tools/discovery.py
+@@ -0,0 +1,173 @@
++"""Tool discovery MCP tools.
++
++Lightweight search over the registered tool catalog so MCP clients can find
++the right tool without loading every tool schema into context. Categories
++are derived dynamically from the module a tool is defined in
++(``telegram_mcp.tools.<module>``), so new tools are covered automatically
++without editing this file.
++
++These tools only read the local tool registry; they never call Telegram.
++"""
++
++import json
++
++from telegram_mcp.runtime import *
++
++# Human-facing labels for tool categories. Categories themselves are the
++# module names below; modules without an explicit label fall back to the
++# module name.
++_CATEGORY_LABELS = {
++    "accounts": "Accounts",
++    "chats": "Chats",
++    "contacts": "Contacts",
++    "content": "Content & Analysis",
++    "database": "Jobs & Database",
++    "diagnostics": "Diagnostics",
++    "discovery": "Discovery",
++    "events": "Events",
++    "folders": "Folders & Drafts",
++    "forum_forward": "Forum Forwarding",
++    "groups": "Groups & Admin",
++    "media": "Media",
++    "messages": "Messages",
++    "migration": "Migration",
++    "profile": "Profile & Privacy",
++}
++
++_MAX_MATCHES = 25
++_DESCRIPTION_LIMIT = 300
++
++
++def _tool_category(tool) -> str:
++    """Derive a tool's category from the module it is defined in."""
++    fn = getattr(tool, "fn", None)
++    module = getattr(fn, "__module__", "") or ""
++    if module.startswith("telegram_mcp.tools."):
++        return module.rsplit(".", 1)[-1]
++    return "general"
++
++
++def _category_label(category: str) -> str:
++    return _CATEGORY_LABELS.get(category, category)
++
++
++def _registered_tools() -> list:
++    return list(mcp._tool_manager.list_tools())
++
++
++def _tool_entry(tool) -> dict:
++    description = (tool.description or "").strip()
++    if len(description) > _DESCRIPTION_LIMIT:
++        description = description[: _DESCRIPTION_LIMIT - 1].rstrip() + "..."
++    annotations = getattr(tool, "annotations", None)
++    category = _tool_category(tool)
++    return {
++        "name": tool.name,
++        "category": category,
++        "category_label": _category_label(category),
++        "read_only": bool(getattr(annotations, "readOnlyHint", False)),
++        "description": description,
++    }
++
++
++@mcp.tool(
++    annotations=ToolAnnotations(
++        title="List Tool Categories",
++        readOnlyHint=True,
++        openWorldHint=False,
++        idempotentHint=True,
++    )
++)
++async def list_tool_categories() -> str:
++    """List every tool category with tool counts and a few example tool names.
++
++    Call this first to orient yourself, then use ``search_tools`` to find a
++    specific tool. The catalog is computed from the tools registered on this
++    server, so the list always reflects the live tool set.
++    """
++    counts: dict[str, int] = {}
++    examples: dict[str, list[str]] = {}
++    for tool in _registered_tools():
++        category = _tool_category(tool)
++        counts[category] = counts.get(category, 0) + 1
++        examples.setdefault(category, []).append(tool.name)
++
++    categories = [
++        {
++            "category": category,
++            "label": _category_label(category),
++            "tool_count": counts[category],
++            "example_tools": sorted(examples[category])[:5],
++        }
++        for category in sorted(counts)
++    ]
++    payload = {
++        "categories": categories,
++        "total_tools": sum(counts.values()),
++        "hint": "Call search_tools(query='keyword') to find a specific tool.",
++    }
++    return json.dumps(payload, indent=2, ensure_ascii=False)
++
++
++@mcp.tool(
++    annotations=ToolAnnotations(
++        title="Search Tools",
++        readOnlyHint=True,
++        openWorldHint=False,
++        idempotentHint=True,
++    )
++)
++async def search_tools(query: str, category: str = None) -> str:
++    """Search available tools by keyword, optionally filtered by category.
++
++    All words in ``query`` must match (case-insensitive) against tool names,
++    descriptions, and category labels. Returns at most 25 matches.
++
++    Args:
++        query: keyword(s) to search for, e.g. "send photo" or "ban".
++            Must be non-empty; use list_tool_categories to browse.
++        category: optional category filter, e.g. "messages", "migration",
++            "groups". See list_tool_categories for valid values.
++    """
++    q = (query or "").strip().lower()
++    if not q:
++        return (
++            "Error: 'query' must be a non-empty keyword. "
++            "Call list_tool_categories to browse all categories."
++        )
++    cat = (category or "").strip().lower()
++    words = q.split()
++
++    matches = []
++    for tool in _registered_tools():
++        category = _tool_category(tool)
++        if cat and category != cat and _category_label(category).lower() != cat:
++            continue
++        haystack = " ".join(
++            (
++                tool.name.lower(),
++                (tool.description or "").lower(),
++                category,
++                _category_label(category).lower(),
++            )
++        )
++        if all(word in haystack for word in words):
++            matches.append(_tool_entry(tool))
++
++    matches.sort(key=lambda entry: entry["name"])
++    truncated = len(matches) > _MAX_MATCHES
++    payload = {
++        "count": len(matches[:_MAX_MATCHES]),
++        "total_matches": len(matches),
++        "truncated": truncated,
++        "matches": matches[:_MAX_MATCHES],
++    }
++    if not matches:
++        payload["hint"] = (
++            "No tools matched. Try a broader keyword or call "
++            "list_tool_categories."
++        )
++    return json.dumps(payload, indent=2, ensure_ascii=False)
++
++
++__all__ = ["list_tool_categories", "search_tools"]
+diff --git a/telegram_media.db b/telegram_media.db
+deleted file mode 100644
+index e14c83c..0000000
+Binary files a/telegram_media.db and /dev/null differ
+diff --git a/tests/test_audit.py b/tests/test_audit.py
+new file mode 100644
+index 0000000..75dcc58
+--- /dev/null
++++ b/tests/test_audit.py
+@@ -0,0 +1,153 @@
++"""Tests for audit logging (telegram_mcp.audit + with_account integration)."""
++
++import json
++
++import pytest
++
++from telegram_mcp import audit, runtime
++
++
++def _read_lines(path):
++    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
++
++
++def test_audit_disabled_by_default(tmp_path, monkeypatch):
++    monkeypatch.delenv("TELEGRAM_AUDIT_LOG", raising=False)
++
++    path = tmp_path / "audit.log"
++    audit.record_audit(tool_name="some_tool", ok=True)
++
++    assert audit.audit_enabled() is False
++    assert not path.exists()
++
++
++def test_audit_writes_jsonl(tmp_path, monkeypatch):
++    path = tmp_path / "sub" / "audit.log"
++    monkeypatch.setenv("TELEGRAM_AUDIT_LOG", str(path))
++
++    audit.record_audit(tool_name="send_message", account="main", ok=True)
++    audit.record_audit(tool_name="ban_user", account="main", ok=False, error="ValueError")
++
++    lines = _read_lines(path)
++    assert len(lines) == 2
++    assert lines[0]["tool"] == "send_message"
++    assert lines[0]["account"] == "main"
++    assert lines[0]["ok"] is True
++    assert "ts" in lines[0]
++    assert "arg_names" not in lines[0]
++    assert lines[1]["ok"] is False
++    assert lines[1]["error"] == "ValueError"
++
++
++def test_audit_arg_names_only_when_enabled(tmp_path, monkeypatch):
++    path = tmp_path / "audit.log"
++    monkeypatch.setenv("TELEGRAM_AUDIT_LOG", str(path))
++    monkeypatch.setenv("TELEGRAM_AUDIT_LOG_ARGS", "1")
++
++    audit.record_audit(tool_name="send_message", ok=True, arg_names=["message", "chat_id"])
++
++    raw = path.read_text()
++    data = json.loads(raw)
++    # Names only - sorted and de-duplicated.
++    assert data["arg_names"] == ["chat_id", "message"]
++    # Argument values must never appear.
++    assert "hello" not in raw
++
++
++def test_audit_never_raises_on_io_failure(tmp_path, monkeypatch):
++    blocker = tmp_path / "blocked"
++    blocker.mkdir()  # a directory where a file is expected -> open("a") fails
++    monkeypatch.setenv("TELEGRAM_AUDIT_LOG", str(blocker))
++
++    audit.record_audit(tool_name="some_tool", ok=True)  # must not raise
++
++
++def test_audit_error_truncated(tmp_path, monkeypatch):
++    path = tmp_path / "audit.log"
++    monkeypatch.setenv("TELEGRAM_AUDIT_LOG", str(path))
++
++    audit.record_audit(tool_name="t", ok=False, error="X" * 500)
++
++    data = _read_lines(path)[0]
++    assert len(data["error"]) <= 200
++
++
++@pytest.mark.asyncio
++async def test_with_account_records_successful_call(tmp_path, monkeypatch):
++    monkeypatch.setenv("TELEGRAM_AUDIT_LOG", str(tmp_path / "audit.log"))
++
++    @runtime.with_account(readonly=False)
++    async def fake_write(chat_id, account=None):
++        return "done"
++
++    assert await fake_write(chat_id=5) == "done"
++
++    lines = _read_lines(tmp_path / "audit.log")
++    assert lines[0]["tool"] == "fake_write"
++    assert lines[0]["ok"] is True
++    assert lines[0]["account"] is None
++
++
++@pytest.mark.asyncio
++async def test_with_account_records_failed_call(tmp_path, monkeypatch):
++    monkeypatch.setenv("TELEGRAM_AUDIT_LOG", str(tmp_path / "audit.log"))
++
++    @runtime.with_account(readonly=False)
++    async def fake_fail(chat_id, account=None):
++        raise ValueError("boom")
++
++    with pytest.raises(ValueError):
++        await fake_fail(chat_id=5)
++
++    lines = _read_lines(tmp_path / "audit.log")
++    assert lines[0]["tool"] == "fake_fail"
++    assert lines[0]["ok"] is False
++    assert lines[0]["error"] == "ValueError"
++
++
++@pytest.mark.asyncio
++async def test_with_account_audit_does_not_mask_result(tmp_path, monkeypatch):
++    # A broken audit path must not break the tool itself.
++    blocker = tmp_path / "blocked"
++    blocker.mkdir()
++    monkeypatch.setenv("TELEGRAM_AUDIT_LOG", str(blocker))
++
++    @runtime.with_account(readonly=True)
++    async def fake_read(chat_id, account=None):
++        return "value"
++
++    assert await fake_read(chat_id=5) == "value"
++
++
++def test_audit_records_duration(tmp_path, monkeypatch):
++    path = tmp_path / "audit.log"
++    monkeypatch.setenv("TELEGRAM_AUDIT_LOG", str(path))
++
++    audit.record_audit(tool_name="send_message", ok=True, duration_ms=12.3456)
++
++    data = _read_lines(path)[0]
++    assert data["duration_ms"] == 12.346  # rounded to 3 decimals
++
++
++def test_audit_omits_duration_when_not_provided(tmp_path, monkeypatch):
++    path = tmp_path / "audit.log"
++    monkeypatch.setenv("TELEGRAM_AUDIT_LOG", str(path))
++
++    audit.record_audit(tool_name="t", ok=True)
++
++    assert "duration_ms" not in _read_lines(path)[0]
++
++
++@pytest.mark.asyncio
++async def test_with_account_records_duration(tmp_path, monkeypatch):
++    monkeypatch.setenv("TELEGRAM_AUDIT_LOG", str(tmp_path / "audit.log"))
++
++    @runtime.with_account(readonly=False)
++    async def fake_write(chat_id, account=None):
++        return "done"
++
++    await fake_write(chat_id=5)
++
++    line = _read_lines(tmp_path / "audit.log")[0]
++    assert "duration_ms" in line
++    assert line["duration_ms"] >= 0
+diff --git a/tests/test_diagnostics.py b/tests/test_diagnostics.py
+new file mode 100644
+index 0000000..6e14158
+--- /dev/null
++++ b/tests/test_diagnostics.py
+@@ -0,0 +1,61 @@
++"""Tests for the telegram_health_check diagnostics tool."""
++
++import json
++
++import pytest
++
++import main  # noqa: F401  (registers every tool on the shared server)
++from telegram_mcp import runtime
++from telegram_mcp.tools.diagnostics import (
++    _session_file_info,
++    telegram_health_check,
++)
++
++
++def test_health_check_registered_read_only():
++    tools = {t.name: t for t in runtime.mcp._tool_manager.list_tools()}
++
++    assert "telegram_health_check" in tools
++    assert tools["telegram_health_check"].annotations.readOnlyHint is True
++
++
++@pytest.mark.asyncio
++async def test_health_check_payload_shape():
++    payload = json.loads(await telegram_health_check())
++
++    assert payload["server"]["accounts_configured"] >= 1
++    assert "default" in {a["label"] for a in payload["accounts"]}
++    for account in payload["accounts"]:
++        assert account["session_type"] in {"string", "file"}
++        assert "session_file_readable_by_others" in account
++    assert "disk" in payload
++    assert isinstance(payload["migration_jobs"], list)
++
++
++def test_session_file_info_for_missing_file():
++    class FakeSession:
++        session_file = "/nonexistent/path/that/does/not/exist.session"
++
++    info = _session_file_info(FakeSession())
++
++    assert info["session_type"] == "file"
++    assert info["session_file_mode"] is None
++    assert info["session_file_readable_by_others"] is None
++
++
++def test_session_file_info_detects_world_readable(tmp_path):
++    session_path = tmp_path / "s.session"
++    session_path.write_text("x")
++    session_path.chmod(0o644)
++
++    class FakeSession:
++        session_file = str(session_path)
++
++    info = _session_file_info(FakeSession())
++
++    assert info["session_file_mode"] == "644"
++    assert info["session_file_readable_by_others"] is True
++
++    session_path.chmod(0o600)
++    info = _session_file_info(FakeSession())
++    assert info["session_file_readable_by_others"] is False
+diff --git a/tests/test_forum_topics.py b/tests/test_forum_topics.py
+index 69b6d0f..7c3ac85 100644
+--- a/tests/test_forum_topics.py
++++ b/tests/test_forum_topics.py
+@@ -116,3 +116,69 @@ async def test_create_forum_topic_requires_forum_enabled(monkeypatch):
+         == "The specified supergroup does not have forum topics enabled. Use enable_forum_topics first."
+     )
+     assert client.requests == []
++
++
++class _FakeTopic:
++    def __init__(self, i):
++        self.id = i
++        self.title = f"Topic {i}"
++        self.total_messages = None
++        self.unread_count = 0
++        self.closed = False
++        self.hidden = False
++        self.top_message = None
++
++
++def _setup_list_topics(monkeypatch, fake_topics):
++    entity = _supergroup(forum=True)
++    client = RecordingClient(
++        result=SimpleNamespace(topics=fake_topics, messages=[])
++    )
++
++    async def fake_resolve(chat_id, cl):
++        return entity
++
++    monkeypatch.setattr(chats, "get_client", lambda account=None: client)
++    monkeypatch.setattr(chats, "resolve_entity", fake_resolve)
++    return entity
++
++
++@pytest.mark.asyncio
++async def test_list_topics_full_page_warns_more_topics_exist(monkeypatch):
++    # Exactly 100 topics = a full Telegram page -> result must warn.
++    _setup_list_topics(monkeypatch, [_FakeTopic(i) for i in range(1, 101)])
++
++    out = json.loads(await chats.list_topics(chat_id=12345))
++
++    assert "warning" in out
++    assert "fetch_all=True" in out["warning"]
++    assert len(out["results"]) == 100
++
++
++@pytest.mark.asyncio
++async def test_list_topics_partial_page_has_no_warning(monkeypatch):
++    _setup_list_topics(monkeypatch, [_FakeTopic(i) for i in range(1, 51)])
++
++    out = json.loads(await chats.list_topics(chat_id=12345))
++
++    assert "warning" not in out
++    assert len(out["results"]) == 50
++
++
++@pytest.mark.asyncio
++async def test_list_topics_fetch_all_reports_total(monkeypatch):
++    _setup_list_topics(monkeypatch, [])
++
++    async def fake_iter(cl, entity, page_size=100):
++        for i in range(1, 251):
++            yield _FakeTopic(i)
++
++    monkeypatch.setattr(
++        "telegram_mcp.forum_pagination.iter_forum_topics", fake_iter
++    )
++
++    out = json.loads(await chats.list_topics(chat_id=12345, fetch_all=True))
++
++    assert out["total_topics"] == 250
++    assert len(out["results"]) == 250
++    assert "warning" not in out
+diff --git a/tests/test_install_guard.py b/tests/test_install_guard.py
+index 4166cd0..c038ce5 100644
+--- a/tests/test_install_guard.py
++++ b/tests/test_install_guard.py
+@@ -83,7 +83,7 @@ def test_install_guard_rejects_known_pypi_collision_metadata():
+     assert "Refusing to start" in message
+     assert "0.6.3" in message
+     assert "Furkan Kucuk" in message
+-    assert "git+https://github.com/chigwell/telegram-mcp.git" in message
++    assert "git+https://github.com/m07o/telegram-mcp.git" in message
+ 
+ 
+ def test_install_guard_rejects_spoofed_metadata_without_trusted_origin():
+diff --git a/tests/test_retry.py b/tests/test_retry.py
+new file mode 100644
+index 0000000..1c004d1
+--- /dev/null
++++ b/tests/test_retry.py
+@@ -0,0 +1,95 @@
++"""Tests for opt-in transient-error retry in the with_account choke point."""
++
++import pytest
++
++from telegram_mcp import runtime
++
++
++def _make_flaky_tool(fail_times: int, exc_type: type):
++    calls = {"n": 0}
++
++    @runtime.with_account(readonly=False)
++    async def flaky(chat_id, account=None):
++        calls["n"] += 1
++        if calls["n"] <= fail_times:
++            raise exc_type("flaky")
++        return "ok"
++
++    return flaky, calls
++
++
++@pytest.mark.asyncio
++async def test_retry_disabled_by_default(monkeypatch):
++    monkeypatch.delenv("TELEGRAM_RETRY_TRANSIENT", raising=False)
++
++    flaky, calls = _make_flaky_tool(fail_times=99, exc_type=ConnectionResetError)
++
++    with pytest.raises(ConnectionResetError):
++        await flaky(chat_id=1)
++
++    assert calls["n"] == 1  # no retry happened
++
++
++@pytest.mark.asyncio
++async def test_retry_transient_then_succeeds(monkeypatch):
++    monkeypatch.setenv("TELEGRAM_RETRY_TRANSIENT", "2")
++    monkeypatch.setattr(runtime, "_backoff_delay", lambda attempt: 0.0)
++
++    flaky, calls = _make_flaky_tool(fail_times=1, exc_type=ConnectionResetError)
++
++    assert await flaky(chat_id=1) == "ok"
++    assert calls["n"] == 2  # initial attempt + 1 retry
++
++
++@pytest.mark.asyncio
++async def test_retry_gives_up_after_max(monkeypatch):
++    monkeypatch.setenv("TELEGRAM_RETRY_TRANSIENT", "2")
++    monkeypatch.setattr(runtime, "_backoff_delay", lambda attempt: 0.0)
++
++    flaky, calls = _make_flaky_tool(fail_times=99, exc_type=TimeoutError)
++
++    with pytest.raises(TimeoutError):
++        await flaky(chat_id=1)
++
++    assert calls["n"] == 3  # initial attempt + 2 retries
++
++
++@pytest.mark.asyncio
++async def test_non_transient_errors_are_not_retried(monkeypatch):
++    monkeypatch.setenv("TELEGRAM_RETRY_TRANSIENT", "3")
++    monkeypatch.setattr(runtime, "_backoff_delay", lambda attempt: 0.0)
++
++    flaky, calls = _make_flaky_tool(fail_times=99, exc_type=ValueError)
++
++    with pytest.raises(ValueError):
++        await flaky(chat_id=1)
++
++    assert calls["n"] == 1
++
++
++def test_get_transient_retry_count_validation(monkeypatch):
++    monkeypatch.delenv("TELEGRAM_RETRY_TRANSIENT", raising=False)
++    assert runtime._get_transient_retry_count() == 0
++
++    monkeypatch.setenv("TELEGRAM_RETRY_TRANSIENT", "3")
++    assert runtime._get_transient_retry_count() == 3
++
++    monkeypatch.setenv("TELEGRAM_RETRY_TRANSIENT", "99")
++    assert runtime._get_transient_retry_count() == 5  # capped
++
++    monkeypatch.setenv("TELEGRAM_RETRY_TRANSIENT", "-2")
++    assert runtime._get_transient_retry_count() == 0
++
++    monkeypatch.setenv("TELEGRAM_RETRY_TRANSIENT", "not-a-number")
++    assert runtime._get_transient_retry_count() == 0
++
++
++def test_backoff_delay_exponential_with_cap():
++    delays = [runtime._backoff_delay(i) for i in (1, 2, 3, 4, 5, 6)]
++    assert 1.0 <= delays[0] < 1.5
++    assert 2.0 <= delays[1] < 2.5
++    assert 4.0 <= delays[2] < 4.5
++    assert 8.0 <= delays[3] < 8.5
++    # Attempts 5 and 6 would be 16s/32s - capped to 10s.
++    assert 10.0 <= delays[4] < 10.5
++    assert 10.0 <= delays[5] < 10.5
+diff --git a/tests/test_runtime.py b/tests/test_runtime.py
+index eb3400d..f5e2eaa 100644
+--- a/tests/test_runtime.py
++++ b/tests/test_runtime.py
+@@ -46,7 +46,118 @@ def _synthetic_mcp():
+ def test_get_exposed_tools_mode_defaults_to_all(monkeypatch):
+     monkeypatch.delenv("TELEGRAM_EXPOSED_TOOLS", raising=False)
+ 
+-    assert runtime._get_exposed_tools_mode() == "all"
++    assert runtime._get_exposed_tools_mode() == ["all"]
++
++
++def test_get_exposed_tools_mode_accepts_comma_separated_list():
++    assert runtime._get_exposed_tools_mode("read-only, write") == ["read-only", "write"]
++    assert runtime._get_exposed_tools_mode("read-only,read-only") == ["read-only"]
++    assert runtime._get_exposed_tools_mode("  ") == ["all"]
++
++
++def test_get_exposed_tools_mode_rejects_invalid_tier_in_list():
++    with pytest.raises(SystemExit) as excinfo:
++        runtime._get_exposed_tools_mode("read-only,bogus")
++
++    message = str(excinfo.value)
++    assert "TELEGRAM_EXPOSED_TOOLS" in message
++    for tier in ("all", "read-only", "write", "admin", "migration"):
++        assert tier in message
++
++
++def test_tool_tier_classification():
++    server = _synthetic_mcp()
++    tools = {tool.name: tool for tool in server._tool_manager.list_tools()}
++
++    assert runtime._tool_tier(tools["read_tool"]) == "read-only"
++    assert runtime._tool_tier(tools["write_tool"]) == "write"
++
++    # Admin classification is by explicit tool name.
++    admin_tool = tools["write_tool"].model_copy(update={"name": "ban_user"})
++    assert runtime._tool_tier(admin_tool) == "admin"
++
++    # Migration classification is by defining module.
++    migration_tool = tools["write_tool"].model_copy(
++        update={
++            "name": "some_migration_write",
++            "fn": SimpleNamespace(__module__="telegram_mcp.tools.migration"),
++        }
++    )
++    assert runtime._tool_tier(migration_tool) == "migration"
++
++    # Read-only wins over module location (least privilege first).
++    readonly_migration = tools["read_tool"].model_copy(
++        update={
++            "name": "get_migration_state",
++            "fn": SimpleNamespace(__module__="telegram_mcp.tools.migration"),
++        }
++    )
++    assert runtime._tool_tier(readonly_migration) == "read-only"
++
++
++def test_apply_exposed_tools_admin_keeps_only_admin_tier():
++    server = FastMCP("test")
++
++    @server.tool(annotations=ToolAnnotations(title="Read", readOnlyHint=True))
++    def read_tool():
++        return "read"
++
++    @server.tool(annotations=ToolAnnotations(title="Write"))
++    def write_tool():
++        return "write"
++
++    @server.tool(annotations=ToolAnnotations(title="Ban", destructiveHint=True))
++    def ban_user():
++        return "banned"
++
++    removed = runtime._apply_exposed_tools_mode(server, "admin")
++
++    assert set(_tool_names(server)) == {"ban_user"}
++    assert sorted(removed) == ["read_tool", "write_tool"]
++
++
++def test_apply_exposed_tools_migration_removes_other_modules():
++    server = FastMCP("test")
++
++    @server.tool(annotations=ToolAnnotations(title="Write"))
++    def plain_write_tool():
++        return "w"
++
++    @server.tool(annotations=ToolAnnotations(title="Migrate"))
++    def migrate_tool():
++        return "m"
++
++    server._tool_manager._tools["migrate_tool"] = server._tool_manager._tools[
++        "migrate_tool"
++    ].model_copy(
++        update={"fn": SimpleNamespace(__module__="telegram_mcp.tools.migration")}
++    )
++
++    removed = runtime._apply_exposed_tools_mode(server, "migration")
++
++    assert set(_tool_names(server)) == {"migrate_tool"}
++    assert removed == ["plain_write_tool"]
++
++
++def test_apply_exposed_tools_union_of_tiers():
++    server = FastMCP("test")
++
++    @server.tool(annotations=ToolAnnotations(title="Read", readOnlyHint=True))
++    def read_tool():
++        return "read"
++
++    @server.tool(annotations=ToolAnnotations(title="Write"))
++    def write_tool():
++        return "write"
++
++    @server.tool(annotations=ToolAnnotations(title="Ban", destructiveHint=True))
++    def ban_user():
++        return "banned"
++
++    removed = runtime._apply_exposed_tools_mode(server, "read-only,admin")
++
++    assert set(_tool_names(server)) == {"read_tool", "ban_user"}
++    assert removed == ["write_tool"]
+ 
+ 
+ def test_apply_exposed_tools_all_keeps_tools():
+@@ -802,3 +913,104 @@ async def test_empty_client_roots_fallback_noop_without_server_roots(monkeypatch
+     roots, status = await runtime._get_effective_allowed_roots_with_status(_ctx_with_roots([]))
+     assert roots == []
+     assert status == runtime.ROOTS_STATUS_CLIENT_DENY_ALL
++
++
++# ---------------------------------------------------------------------------
++# Startup validation, stable error codes, result-size policy, session perms
++# ---------------------------------------------------------------------------
++
++
++def test_require_env_int_parses_valid_value(monkeypatch):
++    monkeypatch.setenv("TELEGRAM_API_ID", "12345")
++
++    assert runtime._require_env_int("TELEGRAM_API_ID") == 12345
++
++
++def test_require_env_int_rejects_missing_and_non_integer(monkeypatch):
++    monkeypatch.delenv("TELEGRAM_API_ID", raising=False)
++
++    with pytest.raises(SystemExit) as excinfo:
++        runtime._require_env_int("TELEGRAM_API_ID")
++    assert "TELEGRAM_API_ID" in str(excinfo.value)
++    assert "my.telegram.org" in str(excinfo.value)
++
++    monkeypatch.setenv("TELEGRAM_API_ID", "not-a-number")
++    with pytest.raises(SystemExit):
++        runtime._require_env_int("TELEGRAM_API_ID")
++
++
++def test_error_code_is_stable_across_calls():
++    import re
++
++    first = runtime.log_and_format_error("list_chats", RuntimeError("x"))
++    second = runtime.log_and_format_error("list_chats", RuntimeError("y"))
++
++    code1 = re.search(r"code: ([A-Z]+-ERR-\d{3})", first).group(1)
++    code2 = re.search(r"code: ([A-Z]+-ERR-\d{3})", second).group(1)
++    # crc32-based: identical across calls (and across processes/restarts).
++    assert code1 == code2
++
++
++def test_get_max_result_chars(monkeypatch):
++    monkeypatch.delenv("TELEGRAM_MAX_RESULT_CHARS", raising=False)
++    assert runtime._get_max_result_chars() is None
++
++    monkeypatch.setenv("TELEGRAM_MAX_RESULT_CHARS", "1000")
++    assert runtime._get_max_result_chars() == 1000
++
++    monkeypatch.setenv("TELEGRAM_MAX_RESULT_CHARS", "bogus")
++    assert runtime._get_max_result_chars() is None
++
++    monkeypatch.setenv("TELEGRAM_MAX_RESULT_CHARS", "0")
++    assert runtime._get_max_result_chars() is None
++
++
++def test_result_size_policy_truncates_when_capped(monkeypatch):
++    from mcp.types import TextContent
++
++    big = TextContent(type="text", text="x" * 5000)
++    small = TextContent(type="text", text="ok")
++    monkeypatch.setenv("TELEGRAM_MAX_RESULT_CHARS", "100")
++
++    out = runtime._apply_result_size_policy([big, small], "big_tool")
++
++    assert len(out[0].text) == 100 + len(runtime._RESULT_TRUNCATION_MARKER)
++    assert out[0].text.endswith("TELEGRAM_MAX_RESULT_CHARS]")
++    assert out[1].text == "ok"  # under cap: untouched
++
++
++def test_result_size_policy_untouched_without_cap():
++    from mcp.types import TextContent
++
++    big = TextContent(type="text", text="y" * (runtime._RESULT_WARN_CHARS + 1))
++
++    out = runtime._apply_result_size_policy([big], "big_tool")
++
++    assert out[0].text == "y" * (runtime._RESULT_WARN_CHARS + 1)
++
++
++def test_world_readable_session_warns(tmp_path, monkeypatch, caplog):
++    import logging
++
++    session_path = tmp_path / "secret.session"
++    session_path.write_text("session-data")
++    session_path.chmod(0o644)
++
++    class FakeSession:
++        session_file = str(session_path)
++
++    class FakeClient:
++        session = FakeSession()
++
++    monkeypatch.setattr(runtime, "clients", {"default": FakeClient()})
++
++    with caplog.at_level(logging.WARNING, logger="telegram_mcp"):
++        runtime._warn_world_readable_sessions()
++    assert any("readable by group/others" in r.message for r in caplog.records)
++
++    # 0600 is fine: no warning.
++    session_path.chmod(0o600)
++    caplog.clear()
++    with caplog.at_level(logging.WARNING, logger="telegram_mcp"):
++        runtime._warn_world_readable_sessions()
++    assert not any("readable by group/others" in r.message for r in caplog.records)
+diff --git a/tests/test_tool_discovery.py b/tests/test_tool_discovery.py
+new file mode 100644
+index 0000000..c92ec36
+--- /dev/null
++++ b/tests/test_tool_discovery.py
+@@ -0,0 +1,112 @@
++"""Tests for the tool discovery MCP tools (search_tools / list_tool_categories)."""
++
++import json
++from types import SimpleNamespace
++
++import pytest
++
++import main  # noqa: F401  (registers every tool on the shared server)
++from telegram_mcp import runtime
++from telegram_mcp.tools.discovery import (
++    _tool_category,
++    list_tool_categories,
++    search_tools,
++)
++
++
++def _tool_names():
++    return {tool.name for tool in runtime.mcp._tool_manager.list_tools()}
++
++
++def test_discovery_tools_registered_as_read_only():
++    tools = {t.name: t for t in runtime.mcp._tool_manager.list_tools()}
++    for name in ("search_tools", "list_tool_categories"):
++        assert name in tools
++        assert tools[name].annotations.readOnlyHint is True
++
++
++def test_tool_category_derived_from_module():
++    class FakeTool:
++        name = "x"
++        fn = SimpleNamespace(__module__="telegram_mcp.tools.media")
++
++    assert _tool_category(FakeTool()) == "media"
++
++    class ForeignTool:
++        name = "y"
++        fn = SimpleNamespace(__module__="somewhere.else")
++
++    assert _tool_category(ForeignTool()) == "general"
++
++
++@pytest.mark.asyncio
++async def test_list_tool_categories_shape():
++    result = json.loads(await list_tool_categories())
++
++    assert result["total_tools"] == len(_tool_names())
++    categories = {c["category"]: c for c in result["categories"]}
++    assert {"messages", "migration", "groups", "discovery"} <= set(categories)
++    assert categories["messages"]["tool_count"] > 0
++    assert all(isinstance(c["example_tools"], list) for c in result["categories"])
++    # Counts add up to the total.
++    assert sum(c["tool_count"] for c in result["categories"]) == result["total_tools"]
++
++
++@pytest.mark.asyncio
++async def test_search_tools_finds_send_message():
++    result = json.loads(await search_tools("send"))
++
++    names = {m["name"] for m in result["matches"]}
++    assert "send_message" in names
++    assert result["count"] == len(result["matches"])
++    for match in result["matches"]:
++        assert {"name", "category", "read_only", "description"} <= set(match)
++
++
++@pytest.mark.asyncio
++async def test_search_tools_multi_word_and_semantics():
++    result = json.loads(await search_tools("edit title"))
++
++    names = {m["name"] for m in result["matches"]}
++    assert "edit_chat_title" in names
++    # "edit_chat_photo" has no "title" in name/description: must not match.
++    assert "edit_chat_photo" not in names
++
++
++@pytest.mark.asyncio
++async def test_search_tools_category_filter():
++    result = json.loads(await search_tools("send", category="messages"))
++
++    assert result["matches"]
++    assert all(m["category"] == "messages" for m in result["matches"])
++
++
++@pytest.mark.asyncio
++async def test_search_tools_category_label_filter():
++    result = json.loads(await search_tools("send", category="Messages"))
++
++    assert all(m["category"] == "messages" for m in result["matches"])
++
++
++@pytest.mark.asyncio
++async def test_search_tools_unknown_category_returns_no_matches():
++    result = json.loads(await search_tools("send", category="nope"))
++
++    assert result["matches"] == []
++    assert "hint" in result
++
++
++@pytest.mark.asyncio
++async def test_search_tools_empty_query_is_error():
++    out = await search_tools("   ")
++
++    assert out.startswith("Error:")
++
++
++@pytest.mark.asyncio
++async def test_search_tools_truncates_to_max_matches():
++    result = json.loads(await search_tools("e"))
++
++    assert result["total_matches"] > 25
++    assert result["truncated"] is True
++    assert result["count"] == 25
